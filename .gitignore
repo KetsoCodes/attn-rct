@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Experiment outputs (regenerated, not source)
+logs/
+checkpoints/
+results/
+wandb/
+*.pt
+*.tsv
+
+# Data (generated on the cluster, lives outside the repo)
+/datasets/
+
+# Secrets — never commit
+.bashrc_secrets
+*.key
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
