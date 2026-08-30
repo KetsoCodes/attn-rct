@@ -28,18 +28,18 @@ VARIANTS = ["vanilla", "flash", "linformer", "linear", "sparse"]
 
 # d_model starts at 256, not 128. Linformer's shared E costs a fixed k * max_len =
 # 512,000 parameters regardless of depth, which is ~1.14x the total at the floor but
-# ~2.95x at d_model=128. Raising the floor closes the gap without modifying any arm,
-# without shrinking k (which would handicap the method we are measuring), and without
-# breaking the complete matrix. Run count_params.py to regenerate these figures.
+# Update mades below:
+  # 16, not 32. At batch 32 the memory probe put vanilla at 97% of a 24 GB card at
 DESIGN_SPACE = {
     "d_model": [256, 384],
     "depth": [4, 6],
     "lr": [3e-4, 1e-3],
-    "batch_size": [32],
+    "batch_size": [16],
 }
 
 SEEDS = [0, 1, 2]
 
+# Held constant -- part of the fixed frame, not the design space.
 # Held constant -- part of the fixed frame, not the design space.
 FIXED = {
     "max_len": 2000,
@@ -48,12 +48,16 @@ FIXED = {
     "linformer_sharing": "layerwise",
     "attn_dropout": 0.0,   # ADR-001
     "dropout": 0.1,
-    # "fixed" is Child et al.'s recommended pattern for non-periodic data such as text,
-    # and stride 0 means auto -> round(sqrt(seq_len)), their prescription. We record
-    # both here rather than leaving them to a code default, so a run is reproducible
-    # from the CSV alone.
+    # "fixed" is Child et al.'s recommended pattern for non-periodic data such as text.
+    # The stride is their sqrt(n) prescription resolved against max_len: 45 =
+    # round(sqrt(2000)). We write the resolved number rather than the 0 sentinel so the
+    # value that actually ran is visible in the CSV, and because auto previously meant
+    # sqrt of the PADDED BATCH length, which made the attention pattern depend on how
+    # the shuffle grouped sequences. See docs/fidelity.md.
     "sparse_pattern": "fixed",
-    "sparse_stride": 0,
+    "sparse_stride": 45,
+    # Every arm runs bf16 on sm_86. 
+    "compute_dtype": "bf16",
     "epochs": 20,
     "task": "listops",
 }
