@@ -70,6 +70,7 @@ srun python -m attn_rct.train \
     --checkpoint-dir "$CKPT_DIR" \
     --result-file "$RESULT" \
     --checkpoint-every-min 30 \
+    --phase full \
     --require-flash &
 
 wait
