@@ -18,6 +18,11 @@ SMOKE_MAX_LEN=512
 
 source "$HOME_DIR/miniconda3/etc/profile.d/conda.sh"
 conda activate attnrct
+
+# Sequence lengths vary every batch, so the caching allocator is asked for a differently
+# sized score matrix each time and fragments badly. Set for EVERY arm, or the allocator
+# becomes an arm-dependent variable.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 if [ -f "$HOME/.bashrc_secrets" ]; then
     source "$HOME/.bashrc_secrets"
 fi

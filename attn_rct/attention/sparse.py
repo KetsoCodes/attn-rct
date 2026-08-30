@@ -1,16 +1,23 @@
 """Sparse attention patterns (Child et al. 2019 and Beltagy et al. 2020).
 
-Each query attends to a chosen subset of keys instead of all N. We apply the patterns 
-as a mask over a fully materialised N x N score matrix. The attention we compute is 
-exactly the paper's so quality results are reportable, but memory and wall-clock 
+Each query attends to a chosen subset of keys instead of all N. We apply the patterns
+as a mask over a fully materialised N x N score matrix. The attention we compute is
+exactly the paper's so quality results are reportable, but memory and wall-clock
 are those of dense attention.
+
+Two things are deliberate about how the mask is applied. The pattern is (H, S, S) and
+broadcasts over the batch, and the padding mask is (B, 1, 1, S) and broadcasts over
+heads and queries, so neither is ever expanded to (B, H, S, S) -- combining them into a
+single boolean would cost more memory than the scores themselves. And the pattern is
+built once at max_len and sliced, so the cache holds one tensor per device rather than
+one per distinct padded batch length.
 """
 
 from __future__ import annotations
 
 import math
 import torch
-from .base import AttentionBase
+from .base import AttentionBase, softmax_
 
 
 # Pattern builders returning an (S, S) boolean mask where True means "may attend".
@@ -98,45 +105,86 @@ class SparseAttention(AttentionBase):
                 f"unknown sparse_pattern {self.pattern_name!r}; "
                 f"expected one of {sorted(PATTERNS)}"
             )
-        self.stride = getattr(cfg, "sparse_stride", None)
-        self._cache: dict = {}      # (seq_len, device) mapping to (H, S, S) bool
+        self.max_len = int(cfg.max_len)
+        # 0 or None means auto. We resolve it against max_len, not against the padded
+        # length of whatever batch arrives first: with dynamic padding the latter makes
+        # the attention pattern a function of batch composition, which is a nuisance
+        # variable in the intervention and leaves the mask cache unbounded.
+        configured = getattr(cfg, "sparse_stride", None)
+        self.stride = int(configured) if configured else max(1, round(math.sqrt(self.max_len)))
+        self._full: dict = {}       # device -> (allowed, blocked) at max_len
+        self._cache: dict = {}      # (seq_len, device) -> (H, S, S) bool view of allowed
+        self._blocked: dict = {}    # (seq_len, device) -> (H, S, S) bool view of ~allowed
 
-    def pattern_mask(self, seq_len: int, device) -> torch.Tensor:
-        """Builds and caches the per-head boolean attention pattern."""
-        key = (seq_len, str(device))
-        if key in self._cache:
-            return self._cache[key]
+    def _build(self, device):
+        """Builds the (H, max_len, max_len) pattern once per device, with its negation.
 
-        stride = self.stride or max(1, round(math.sqrt(seq_len)))
+        We keep the negation alongside it because masked_fill_ fills where the mask is
+        True, so the hot path needs "blocked" and the accessor needs "allowed", and
+        recomputing either per call would allocate a full pattern every batch.
+        """
+        key = str(device)
+        if key in self._full:
+            return self._full[key]
+
         builder = PATTERNS[self.pattern_name]
-        mask = torch.stack(
-            [builder(seq_len, stride, head) for head in range(self.n_heads)]
+        allowed = torch.stack(
+            [builder(self.max_len, self.stride, head) for head in range(self.n_heads)]
         ).to(device)
 
         # Force the diagonal to ensure every query keeps at least one key, preventing NaN softmax.
-        diagonal = torch.eye(seq_len, dtype=torch.bool, device=device)
-        mask = mask | diagonal[None]
+        diagonal = torch.eye(self.max_len, dtype=torch.bool, device=device)
+        allowed = allowed | diagonal[None]
 
-        self._cache[key] = mask
-        return mask
+        self._full[key] = (allowed, ~allowed)
+        return self._full[key]
+
+    def pattern_mask(self, seq_len: int, device) -> torch.Tensor:
+        """Returns the cached per-head boolean attention pattern, True where attending is allowed."""
+        return self._masks(seq_len, device)[0]
+
+    def _masks(self, seq_len: int, device):
+        """Returns (allowed, blocked) views for this length, sliced from the max_len pattern.
+
+        Raises:
+            ValueError: If the sequence is longer than the pattern was built for.
+        """
+        key = (seq_len, str(device))
+        if key in self._cache:
+            return self._cache[key], self._blocked[key]
+
+        if seq_len > self.max_len:
+            raise ValueError(
+                f"sequence length {seq_len} exceeds max_len {self.max_len}; "
+                "the pattern cannot be sliced to fit"
+            )
+
+        allowed, blocked = self._build(device)
+        # Views, not copies: every pattern here depends only on row and column indices,
+        # so the top-left corner of the max_len mask is the mask for a shorter sequence.
+        self._cache[key] = allowed[:, :seq_len, :seq_len]
+        self._blocked[key] = blocked[:, :seq_len, :seq_len]
+        return self._cache[key], self._blocked[key]
 
     def _attend(self, q, k, v, mask):
         """Applies the configured sparse pattern and key-padding mask before computing attention."""
         seq_len = q.shape[2]
         scale = 1.0 / math.sqrt(self.head_dim)
-        scores = (q @ k.transpose(-2, -1)) * scale      # (B, H, S, S) materialises full matrix
+        scores = torch.matmul(q * scale, k.transpose(-2, -1))   # (B, H, S, S) materialises full matrix
+        blocked_value = torch.finfo(scores.dtype).min
 
-        allowed = self.pattern_mask(seq_len, q.device)[None]
+        _, blocked = self._masks(seq_len, q.device)
+        scores.masked_fill_(blocked[None], blocked_value)       # (H, S, S) broadcast over the batch
+
         if mask is not None:
-            allowed = allowed & mask[:, None, None, :]
+            scores.masked_fill_(~mask[:, None, None, :], blocked_value)
 
-        # Allow empty padded rows to attend to position 0 to keep softmax finite. 
-        # These are safely discarded by the mean-pool later.
-        empty_rows = ~allowed.any(dim=-1, keepdim=True)
-        if empty_rows.any():
-            rescue = torch.zeros_like(allowed)
-            rescue[..., 0] = True
-            allowed = allowed | (empty_rows & rescue)
+            # A row is empty exactly when its query is padding: the pattern always keeps
+            # the diagonal, so a real query always retains at least its own real key.
+            # Hand those rows key 0 back, as the previous implementation did, so padded
+            # outputs stay one-hot rather than becoming a uniform average. The frame's
+            # mean-pool discards them regardless.
+            empty_rows = scores.amax(dim=-1) == blocked_value   # (B, H, S)
+            scores[..., 0].masked_fill_(empty_rows, 0.0)
 
-        scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
-        return scores.softmax(dim=-1) @ v
+        return softmax_(scores, dim=-1) @ v

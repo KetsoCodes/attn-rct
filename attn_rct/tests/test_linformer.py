@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from attn_rct.attention import ATTENTION_REGISTRY, LinformerAttention
+from attn_rct.attention import linformer as linformer_module
 from attn_rct.attention.linformer import SequenceProjection
 from attn_rct.model import TransformerClassifier, count_parameters
 
@@ -94,20 +95,23 @@ def test_attention_matrix_is_n_by_k():
     cfg = make_cfg(linformer_k=16)
     arm = LinformerAttention(cfg).eval()
 
+    # We spy on the arm's softmax rather than on torch.Tensor.softmax: the score matrix
+    # is normalised in place, so its shape at the moment of the softmax is the only
+    # observable evidence that the projection ran.
     captured = {}
-    original = torch.Tensor.softmax
+    original = linformer_module.softmax_
 
-    def spy(self, dim=-1, **kwargs):
-        captured["shape"] = tuple(self.shape)
-        return original(self, dim, **kwargs)
+    def spy(scores, dim=-1):
+        captured["shape"] = tuple(scores.shape)
+        return original(scores, dim)
 
-    torch.Tensor.softmax = spy
+    linformer_module.softmax_ = spy
     try:
         x, mask = make_batch(seq_len=40)
         with torch.no_grad():
             arm(x, mask)
     finally:
-        torch.Tensor.softmax = original
+        linformer_module.softmax_ = original
 
     assert captured["shape"][-1] == 16, (
         f"scores end in {captured['shape']}; last dim should be k=16, not the "

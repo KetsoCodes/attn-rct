@@ -26,6 +26,12 @@ conda activate attnrct
 
 export PATH=/usr/local/cuda-12.0/bin:$PATH
 export LD_LIBRARY_PATH=/usr/local/cuda-12.0/lib64:${LD_LIBRARY_PATH:-}
+
+# Sequence lengths vary every batch, so the caching allocator is asked for a differently
+# sized score matrix each time and fragments badly -- the failed pilot runs showed
+# 6.5 GB reserved but unallocated. Set for EVERY arm, not just the ones that were
+# failing, or the allocator becomes an arm-dependent variable.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 [ -f ~/.bashrc_secrets ] && source ~/.bashrc_secrets
 
 export WANDB_PROJECT=attn-rct-pilot

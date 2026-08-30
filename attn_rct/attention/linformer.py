@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 import torch
 import torch.nn as nn
-from .base import AttentionBase
+from .base import AttentionBase, softmax_
 
 
 class SequenceProjection(nn.Module):
@@ -116,6 +116,5 @@ class LinformerAttention(AttentionBase):
         # No attention mask is applied here because projected positions are blends of tokens. 
         # Padding was already handled prior to projection.
         scale = 1.0 / math.sqrt(self.head_dim)
-        scores = (q @ k_projected.transpose(-2, -1)) * scale   # (B, H, S, k)
-        weights = scores.softmax(dim=-1)
-        return weights @ v_projected
+        scores = torch.matmul(q * scale, k_projected.transpose(-2, -1))   # (B, H, S, k)
+        return softmax_(scores, dim=-1) @ v_projected

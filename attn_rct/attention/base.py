@@ -16,6 +16,43 @@ import torch
 import torch.nn as nn
 
 
+class _SoftmaxInPlace(torch.autograd.Function):
+    """Softmax that overwrites its input rather than allocating a second tensor.
+
+    The score matrix is by far the largest tensor a materialising arm holds, so a
+    separate probability tensor doubles the transient cost of every layer. We reuse
+    the buffer and hand autograd the standard softmax gradient, which depends only on
+    the probabilities and so is unaffected by the input having been consumed.
+    """
+
+    @staticmethod
+    def forward(ctx, scores, dim):
+        scores.sub_(scores.amax(dim=dim, keepdim=True))
+        scores.exp_()
+        scores.div_(scores.sum(dim=dim, keepdim=True))
+        ctx.mark_dirty(scores)
+        ctx.save_for_backward(scores)
+        ctx.dim = dim
+        return scores
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # dx_i = p_i * (g_i - sum_j g_j p_j), arranged to allocate one tensor, not three.
+        (probs,) = ctx.saved_tensors
+        grad = grad_output * probs
+        grad.addcmul_(probs, grad.sum(dim=ctx.dim, keepdim=True), value=-1)
+        return grad, None
+
+
+def softmax_(scores: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Softmax over `dim`, reusing the `scores` buffer for the result.
+
+    Equivalent to `scores.softmax(dim)` up to floating-point reordering, but the caller
+    must not use `scores` afterwards: it has been overwritten.
+    """
+    return _SoftmaxInPlace.apply(scores, dim)
+
+
 def resolve_compute_dtype(cfg, device: torch.device) -> torch.dtype:
     """Determines the appropriate compute data type for the attention operation.
 
