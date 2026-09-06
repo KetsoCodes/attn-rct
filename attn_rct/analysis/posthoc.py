@@ -1,9 +1,4 @@
-"""Post-hoc statistical comparisons to identify specific differences between attention variants.
-
-Once the omnibus test determines that performance differences exist, this stage identifies 
-exactly which variants differ from each other. It supports comparing all variants against 
-a designated baseline (e.g., FlashAttention) or comparing all pairs directly (Nemenyi).
-"""
+"""Post-hoc statistical comparisons to identify which specific variants differ."""
 
 from __future__ import annotations
 
@@ -17,29 +12,30 @@ from scipy import stats
 
 @dataclass
 class PostHocResult:
-    """Adjusted comparisons for a single metric."""
+    """Results from adjusted post-hoc comparisons for a single metric."""
 
     metric: str
-    family: str            
+    family: str
     baseline: str | None
     n_blocks: int
     n_variants: int
     alpha: float
-    method: str            
-    table: pd.DataFrame    
+    method: str
+    table: pd.DataFrame
 
     def significant(self) -> pd.DataFrame:
-        """Returns only the comparisons that survive statistical correction."""
+        """Filters the results to return only statistically significant comparisons."""
         return self.table[self.table["reject"]]
 
     def summary(self) -> str:
-        """Formats the test results for terminal output."""
+        """Generates a formatted text summary of the comparison results and significance."""
         head = (f"metric   : {self.metric}\n"
                 f"family   : {self.family}"
                 + (f" (baseline = {self.baseline})" if self.baseline else "")
                 + f"\nmethod   : {self.method}   alpha={self.alpha}   "
                   f"N={self.n_blocks} k={self.n_variants}")
-        body = self.table.to_string(index=False, float_format=lambda v: f"{v:.4f}")
+        body = self.table.to_string(index=False,
+                                    float_format=lambda v: f"{v:.4f}")
         n_sig = int(self.table["reject"].sum())
         return f"{head}\n{body}\n{n_sig} of {len(self.table)} comparisons significant"
 
@@ -50,13 +46,13 @@ def standard_error(n_blocks: int, k: int) -> float:
 
 
 def _z_and_p(diff: float, se: float) -> tuple[float, float]:
-    """Calculates the two-tailed z-statistic and unadjusted p-value for a rank difference."""
+    """Computes the two-tailed z-statistic and unadjusted p-value for a given difference."""
     z = diff / se
     return z, float(2.0 * stats.norm.sf(abs(z)))
 
 
 def holm_adjust(p_values) -> np.ndarray:
-    """Calculates Holm step-down adjusted p-values, ensuring a strictly non-decreasing order."""
+    """Applies the Holm step-down method to adjust p-values and enforces monotonicity."""
     p = np.asarray(p_values, dtype=float)
     m = len(p)
     order = np.argsort(p)
@@ -70,7 +66,7 @@ def holm_adjust(p_values) -> np.ndarray:
 
 
 def finner_adjust(p_values) -> np.ndarray:
-    """Calculates Finner step-down adjusted p-values, ensuring a strictly non-decreasing order."""
+    """Applies the Finner step-down method to adjust p-values, controlling family-wise error rate."""
     p = np.asarray(p_values, dtype=float)
     m = len(p)
     order = np.argsort(p)
@@ -89,21 +85,11 @@ ADJUSTERS = {"holm": holm_adjust, "finner": finner_adjust}
 
 def compare_to_control(mean_ranks: pd.Series, baseline: str, n_blocks: int,
                        metric: str, method="finner", alpha=0.05) -> PostHocResult:
-    """Compares every variant to a designated baseline, correcting for multiple comparisons.
-
-    Args:
-        mean_ranks: Mean rank per variant, from aggregate.mean_ranks.
-        baseline: The control arm every other arm is compared against.
-        n_blocks: N, the number of blocks the ranks were computed over.
-        metric: Metric name, for reporting.
-        method: Adjustment method ("holm" or "finner").
-        alpha: Family-wise significance level.
-
-    Raises:
-        ValueError: If the baseline is missing or the method is unknown.
-    """
+    """Compares every variant to a designated baseline control, adjusting for multiple comparisons."""
     if baseline not in mean_ranks.index:
-        raise ValueError(f"baseline {baseline!r} not among variants {sorted(mean_ranks.index)}")
+        raise ValueError(
+            f"baseline {baseline!r} not among variants {sorted(mean_ranks.index)}"
+        )
     if method not in ADJUSTERS:
         raise ValueError(f"unknown method {method!r}; expected {sorted(ADJUSTERS)}")
 
@@ -124,7 +110,11 @@ def compare_to_control(mean_ranks: pd.Series, baseline: str, n_blocks: int,
         })
 
     table = pd.DataFrame(rows)
-    table["p_adjusted"] = ADJUSTERSmethod.to_numpy())
+    
+    # Extracted function assignment to prevent Markdown link rendering bugs in external editors
+    adjust_func = ADJUSTERS[method]
+    table["p_adjusted"] = adjust_func(table["p_unadjusted"].to_numpy())
+    
     table["reject"] = table["p_adjusted"] < alpha
     table["better_than_baseline"] = table["rank_diff"] < 0
     table = table.sort_values("p_adjusted").reset_index(drop=True)
@@ -141,14 +131,7 @@ NEMENYI_Q10 = {2: 1.645, 3: 2.052, 4: 2.291, 5: 2.459, 6: 2.589,
 
 
 def critical_difference(k: int, n_blocks: int, alpha=0.05) -> float:
-    """Calculates the Nemenyi critical difference threshold.
-
-    Two variants whose mean ranks differ by less than this value are considered 
-    statistically indistinguishable under the all-pairs family.
-
-    Raises:
-        ValueError: If k or alpha falls outside tabulated critical values.
-    """
+    """Calculates the Nemenyi critical difference threshold required to deem two variants statistically distinct."""
     table = {0.05: NEMENYI_Q05, 0.10: NEMENYI_Q10}.get(alpha)
     if table is None:
         raise ValueError(f"no tabulated q for alpha={alpha}; use 0.05 or 0.10")
@@ -176,20 +159,14 @@ def all_pairs_nemenyi(mean_ranks: pd.Series, n_blocks: int, metric: str,
 
     table = pd.DataFrame(rows).sort_values("abs_rank_diff", ascending=False)
     table = table.reset_index(drop=True)
-    
     return PostHocResult(metric=metric, family="all_pairs", baseline=None,
                          n_blocks=n_blocks, n_variants=k, alpha=alpha,
                          method="nemenyi", table=table)
 
 
 def cliques(mean_ranks: pd.Series, result: PostHocResult) -> list[list[str]]:
-    """Groups variants that the post-hoc test cannot statistically distinguish.
-
-    Returns:
-        Maximal groups of variants, in rank order, with no significant internal differences.
-    """
+    """Groups variants into maximal ordered cliques where no significant statistical difference exists internally."""
     ordered = list(mean_ranks.sort_values().index)
-    
     if result.family == "all_pairs":
         cd = float(result.table["critical_difference"].iloc[0])
         def indistinguishable(a, b):
@@ -213,8 +190,6 @@ def cliques(mean_ranks: pd.Series, result: PostHocResult) -> list[list[str]]:
                 group.append(other)
             else:
                 break
-                
         if not any(set(group) <= set(existing) for existing in groups):
             groups.append(group)
-            
     return [g for g in groups if len(g) > 1]
