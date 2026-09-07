@@ -1,10 +1,8 @@
-"""Training entry point for a single (design, variant, seed) experimental cell.
+"""Training entry point for a single experimental run.
 
-Executes a single training run where the Slurm array index maps to a specific configuration 
-in the manifest. Includes periodic checkpointing and clean signal handling to survive 
-cluster preemption, ensuring RNG state is preserved for strict experimental pairing.
-
-Writes a single JSON file containing averaged metrics.
+Maps a Slurm array index to a specific configuration in the manifest. Handles 
+periodic checkpointing and cluster preemption signals to ensure training can 
+safely resume without losing random state parity. Outputs final metrics to a JSON file.
 """
 
 from __future__ import annotations
@@ -30,7 +28,7 @@ EXIT_REQUEUE = 42
 
 
 def handle_signal(signum, frame):
-    """Flags when a Slurm walltime warning or kill signal is received to trigger a clean exit."""
+    """Triggers a clean exit and checkpoint upon receiving a cluster kill signal."""
     global INTERRUPTED
     print(f"\n[signal {signum}] walltime approaching -- checkpointing and exiting",
           flush=True)
@@ -42,7 +40,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--row", type=int, required=True)
-    parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--data-dir", default=None,
+                        help="overrides the manifest's per-task data_dir if given")
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--result-file", required=True)
     parser.add_argument("--checkpoint-every-min", type=float, default=30.0)
@@ -62,7 +61,7 @@ def parse_args():
 
 
 def load_manifest_row(manifest: Path, row_index: int) -> SimpleNamespace:
-    """Reads a specific row from the manifest CSV and casts numerical fields appropriately."""
+    """Reads and types a specific row from the manifest CSV."""
     with open(manifest, newline="") as handle:
         rows = list(csv.DictReader(handle))
     if not 1 <= row_index <= len(rows):
@@ -172,9 +171,10 @@ def start_wandb(args, cfg, n_params, vocab_size):
             entity=os.environ.get("WANDB_ENTITY"),
             name=f"{args.phase}/{cfg.run_id}",
             id=f"{args.phase}-{cfg.run_id}",
-            group=f"{args.phase}/design_{cfg.design_id}",
+            group=f"{args.phase}/{cfg.task}/design_{cfg.design_id}",
             job_type=cfg.variant,
-            tags=[args.phase, cfg.variant, f"seed{cfg.seed}", f"design{cfg.design_id}"],
+            tags=[args.phase, cfg.task, cfg.variant,
+                  f"seed{cfg.seed}", f"design{cfg.design_id}"],
             config={**serialisable_config(cfg), "phase": args.phase,
                     "n_params": n_params, "vocab_size": vocab_size},
             resume="allow",
@@ -225,16 +225,24 @@ def main():
     print(f"=== {cfg.run_id} | variant={cfg.variant} | seed={cfg.seed} | {device} ===")
     print(f"config: {vars(cfg)}")
 
-    train_loader, val_loader, vocab = build_dataloaders(
-        args.data_dir, cfg.max_len, cfg.batch_size, cfg.seed, args.num_workers,
+    data_dir = args.data_dir or getattr(cfg, "data_dir", None)
+    if data_dir is None:
+        raise SystemExit(
+            "no data directory: pass --data-dir or include data_dir in the manifest"
+        )
+    train_loader, val_loader, meta = build_dataloaders(
+        cfg.task, data_dir, cfg.max_len, cfg.batch_size, cfg.seed, args.num_workers,
     )
-    print(f"vocab: {len(vocab)} | train batches: {len(train_loader)} "
+    print(f"task: {cfg.task} | vocab: {meta['vocab_size']} | "
+          f"classes: {meta['n_classes']} | train batches: {len(train_loader)} "
           f"| val batches: {len(val_loader)}")
 
     torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.seed)
-    model = TransformerClassifier(cfg, vocab_size=len(vocab)).to(device)
+    model = TransformerClassifier(
+        cfg, vocab_size=meta["vocab_size"], n_classes=meta["n_classes"]
+    ).to(device)
     n_params = count_parameters(model)
     print(f"parameters: {n_params:,}")
 
@@ -245,7 +253,7 @@ def main():
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     start_epoch, best_accuracy = resume(checkpoint_path, model, optimizer, device)
 
-    run = start_wandb(args, cfg, n_params, len(vocab))
+    run = start_wandb(args, cfg, n_params, meta["vocab_size"])
 
     backend = None
     if cfg.variant == "flash" and torch.cuda.is_available():

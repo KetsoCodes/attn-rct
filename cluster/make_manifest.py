@@ -1,19 +1,8 @@
-"""Build the run manifest: one CSV row per (design, variant, seed) cell.
+"""Generates a CSV manifest mapping Slurm array indices to specific training configurations.
 
-The Slurm array index is just an integer, and mapping it to a configuration inside the
-job script would put that mapping in bash where it cannot be inspected or diffed. A CSV
-written up front lets us see exactly what will run before spending the GPU hours, re-run
-a failed task by index into an identical configuration, and join results back to designs
-in the analysis without re-deriving anything.
-
-A *design* is a meaningful configuration -- depth, width, lr, batch. It is what we
-generalise over and the unit of observation in the Friedman test. A *seed* is noise
-control: seeds are averaged within a design x variant cell and are NOT independent
-observations, since treating them as such would inflate n and make the statistics wrong.
-
-Every design runs under every variant, because the Demsar pipeline needs a complete
-design x variant matrix -- one missing cell drops that whole design from the analysis.
-That is why the design space is shared across arms rather than capped per arm.
+This script ensures every combination of task, architectural design, attention variant,
+and random seed is explicitly defined before execution. The resulting manifest allows
+for reproducible job submissions and clean data joining during statistical analysis.
 """
 
 from __future__ import annotations
@@ -23,13 +12,8 @@ import csv
 import itertools
 import json
 
-# Order is fixed so array indices stay stable across regenerations.
 VARIANTS = ["vanilla", "flash", "linformer", "linear", "sparse"]
 
-# d_model starts at 256, not 128. Linformer's shared E costs a fixed k * max_len =
-# 512,000 parameters regardless of depth, which is ~1.14x the total at the floor but
-# Update mades below:
-  # 16, not 32. At batch 32 the memory probe put vanilla at 97% of a 24 GB card at
 DESIGN_SPACE = {
     "d_model": [256, 384],
     "depth": [4, 6],
@@ -39,38 +23,38 @@ DESIGN_SPACE = {
 
 SEEDS = [0, 1, 2]
 
-# Held constant -- part of the fixed frame, not the design space.
-# Held constant -- part of the fixed frame, not the design space.
+TASKS = {
+    "listops": {
+        "max_len": 2000,
+        "data_dir": "/datasets/fmnisi/lra/listops",
+    },
+    "cifar": {
+        "max_len": 1024,
+        "data_dir": "/datasets/fmnisi/cifar",
+    },
+}
+
 FIXED = {
-    "max_len": 2000,
     "n_heads": 8,
     "linformer_k": 256,
     "linformer_sharing": "layerwise",
-    "attn_dropout": 0.0,   # ADR-001
+    "attn_dropout": 0.0,
     "dropout": 0.1,
-    # "fixed" is Child et al.'s recommended pattern for non-periodic data such as text.
-    # The stride is their sqrt(n) prescription resolved against max_len: 45 =
-    # round(sqrt(2000)). We write the resolved number rather than the 0 sentinel so the
-    # value that actually ran is visible in the CSV, and because auto previously meant
-    # sqrt of the PADDED BATCH length, which made the attention pattern depend on how
-    # the shuffle grouped sequences. See docs/fidelity.md.
     "sparse_pattern": "fixed",
     "sparse_stride": 45,
-    # Every arm runs bf16 on sm_86. 
     "compute_dtype": "bf16",
     "epochs": 20,
-    "task": "listops",
 }
 
-# bigbatch allows 6 running jobs per user.
 MAX_CONCURRENT = 6
+MAX_SUBMIT = 48
 
 
 def build_designs():
-    """Enumerate the design space in a stable order.
+    """Enumerates the architectural design space in a stable, deterministic order.
 
     Yields:
-        (design_id, design dict) pairs, with d_ff derived from d_model.
+        Tuple of (design_id, design_dictionary) where d_ff is dynamically derived.
     """
     keys = sorted(DESIGN_SPACE)
     for i, values in enumerate(itertools.product(*(DESIGN_SPACE[k] for k in keys))):
@@ -82,38 +66,57 @@ def build_designs():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="cluster/runs.csv")
+    parser.add_argument("--tasks", nargs="*", default=sorted(TASKS),
+                        help="which tasks to include (default: all registered)")
     args = parser.parse_args()
+
+    for task in args.tasks:
+        if task not in TASKS:
+            raise SystemExit(f"unknown task {task!r}; known: {sorted(TASKS)}")
 
     designs = list(build_designs())
     rows = []
-    for (design_id, design), variant, seed in itertools.product(designs, VARIANTS, SEEDS):
-        rows.append({
-            "run_id": f"d{design_id:03d}_{variant}_s{seed}",
-            "design_id": design_id,
-            "variant": variant,
-            "seed": seed,
-            **design,
-            **FIXED,
-        })
+
+    for task in args.tasks:
+        task_cfg = TASKS[task]
+        for (design_id, design), variant, seed in itertools.product(
+            designs, VARIANTS, SEEDS
+        ):
+            rows.append({
+                "run_id": f"{task}_d{design_id:03d}_{variant}_s{seed}",
+                "task": task,
+                "design_id": design_id,
+                "variant": variant,
+                "seed": seed,
+                "data_dir": task_cfg["data_dir"],
+                "max_len": task_cfg["max_len"],
+                **design,
+                **FIXED,
+            })
 
     with open(args.out, "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
 
+    n_tasks = len(args.tasks)
     n_designs, n_variants, n_seeds = len(designs), len(VARIANTS), len(SEEDS)
-    print(f"designs        : {n_designs}")
+    n_blocks = n_tasks * n_designs
+    
+    print(f"tasks          : {n_tasks}  {args.tasks}")
+    print(f"designs/task   : {n_designs}")
     print(f"variants       : {n_variants}  {VARIANTS}")
     print(f"seeds          : {n_seeds}")
-    print(f"total runs     : {len(rows)}  ({n_designs} x {n_variants} x {n_seeds})")
-    print(f"analysis cells : {n_designs * n_variants}  (seeds averaged within cell)")
+    print(f"total runs     : {len(rows)}  "
+          f"({n_tasks} x {n_designs} x {n_variants} x {n_seeds})")
+    print(f"analysis blocks: {n_blocks}  (task x design)")
+    print(f"analysis cells : {n_blocks * n_variants}  (seeds averaged within cell)")
     print()
     print(f"wrote {args.out}")
-    print(f"submit with: sbatch --array=1-{len(rows)}%{MAX_CONCURRENT} "
-          "cluster/train_array.slurm")
-    print()
-    print("design space:")
-    print(json.dumps(DESIGN_SPACE, indent=2))
+    print(f"NOTE: {len(rows)} runs exceeds the {MAX_SUBMIT}-job submit limit; "
+          f"submit in blocks of <= {MAX_SUBMIT}, e.g.")
+    print(f"  sbatch --array=1-{MAX_SUBMIT}%{MAX_CONCURRENT} cluster/train_array.slurm")
+    print(f"  sbatch --array={MAX_SUBMIT + 1}-{2 * MAX_SUBMIT}%{MAX_CONCURRENT} ...")
 
 
 if __name__ == "__main__":
