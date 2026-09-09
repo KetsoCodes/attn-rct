@@ -1,80 +1,23 @@
-# Design decisions
+# Design Decisions
 
-Decisions that are load-bearing for the paired design. **Do not undo these** without
-understanding what they protect; each one exists because the alternative confounds the
-intervention with something else.
+These are the foundational rules of the experiment. Changing them will ruin the fairness of the test by introducing hidden variables.
 
----
+## Attention Dropout is Disabled
 
-## ADR-001 — attention-weight dropout is 0 for every arm
+We disable attention dropout (setting it to zero) for all models. Different models handle dropout in completely different ways. If we turned it on, each model would be penalized or regularized differently, making it impossible to tell if a performance difference was due to the model's core design or just how it handled dropout. We keep dropout turned on for the parts of the neural network that all models share equally.
 
-Vanilla and Linformer can drop softmax weights. Kernel-based linear attention has no
-attention matrix to drop. The flash kernel implements its own dropout on a different
-RNG stream. So any nonzero `attn_dropout` means a *different regulariser per arm* — an
-arm-specific confound in a study whose entire claim is that only the mechanism differs.
+## Precision Settings
 
-Dropout is retained in the fixed frame (post-attention residual and FFN), where it is
-identical by construction. Set `cfg.attn_dropout > 0` only if you intend to argue for
-it in the write-up.
+FlashAttention physically requires 16-bit precision to run, while the other models normally run in 32-bit. We decided to let FlashAttention run in 16-bit and treat that precision drop as an inherent part of the FlashAttention package. When we write the report, we must clarify that any speedup seen in FlashAttention is a combination of its mathematical design and its lower precision format, as we cannot separate the two.
 
----
+## Paired Initialization
 
-## Precision — flash runs bf16, other arms run fp32
+Every model must start with the exact same random starting weights. To guarantee this, the system generates the shared weights first in a strict order before any specific model adds its own unique parts. If a specific model like Linformer needs extra random numbers, it uses an isolated random number generator. This prevents it from stealing numbers from the main sequence and throwing the rest of the models out of sync.
 
-FA-2 kernels accept fp16/bf16 only, so precision is not a free choice for that arm. The
-dtype is therefore set once in `base.py` and applied to every arm, rather than each arm
-choosing for itself.
+## Padding and Filtering
 
-Steven's decision: treat 16-bit as part of what FlashAttention *is*. **Consequence for
-the write-up: report a PACKAGE effect, not a mechanism effect.** A speedup measured this
-way cannot be decomposed into IO-awareness versus tensor cores — the two are collinear
-by construction.
+When grouping data, we only pad sequences to match the longest item in that specific group, which saves computing power compared to padding everything to the absolute maximum limit. If a sequence is longer than our maximum limit, we delete it entirely instead of chopping off the end. Chopping off the end of a math problem changes the answer, which ruins the data. This means we throw away a lot of long sequences, which is a flaw we must admit in the final report.
 
-`resolve_compute_dtype` prefers bf16 over fp16 on capable hardware because bf16 needs no
-loss scaling, and the flash kernel supports both.
+## Flash Strict Mode
 
----
-
-## Paired initialisation — construction order in `AttentionBase`
-
-`AttentionBase.__init__` builds the fused QKV projection and the output projection in a
-fixed order, before any subclass parameters exist. Subclasses add their own parameters
-after `super().__init__()`, so they consume RNG draws only at the end and cannot shift
-the shared init. Under a fixed seed every arm therefore draws *bit-identical* values for
-the parameters they have in common.
-
-This is a stronger form of pairing than matching hyperparameters: designs start from the
-same weights. Verified by `test_arms_share_initialisation`.
-
-Linformer's E is the one arm-specific parameter created inside a shared code path, so it
-uses a **dedicated generator** (`seed + 90210`). If it drew from the global stream,
-every parameter created afterwards would shift and the guarantee would break silently.
-Do not reorder any of this.
-
----
-
-## Padding — filter, never truncate; pad to the batch maximum
-
-Batches pad to the longest sequence *in the batch*, not to `max_len`. Every arm consumes
-identical batches, so the comparison stays fair and is simply cheaper than padding
-everything to 2000.
-
-Sequences over `max_len` are **filtered**. Truncating a ListOps expression deletes
-label-determining operators, which silently corrupts the label — a wrong label is worse
-than a smaller dataset. See the open length-cap issue in the handover: this currently
-discards a large share of the data and biases what remains toward the short end, which
-is a limitation to state rather than a bug to fix here.
-
----
-
-## `require_flash` — fail loudly
-
-The flash arm raises rather than quietly running a different kernel. Passing an
-`attn_mask` to SDPA disqualifies the FLASH_ATTENTION backend, so a masked call falls
-back to EFFICIENT_ATTENTION *even on sm_80+* — and the pilot's probe reported hardware
-capability rather than the kernel that actually ran, so a 3090 run would have been
-logged as true FA-2 while the mem-efficient kernel executed.
-
-`measure_backend` therefore *measures* by making a real call, and `require_flash=True`
-must be set for every cluster run producing a reportable efficiency number. This has
-already caught one sm_75 run.
+The system is programmed to crash immediately if FlashAttention fails to load properly. Without this strict rule, the system might quietly fall back to a slower, standard method while still labeling the results as FlashAttention. Crashing loudly ensures our speed metrics for FlashAttention are completely genuine.
