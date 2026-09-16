@@ -198,3 +198,49 @@ def test_task_defaults_to_listops_for_old_results(tmp_path):
     df, _ = collect.load_results(tmp_path, phase="full")
     
     assert (df["task"] == "listops").all()
+
+
+def test_linformer_overhead_is_task_aware(tmp_path):
+    """Ensures the Linformer overhead check correctly computes expected parameters per task."""
+    synth.generate(tmp_path, effect=1.0, seed=0)
+    
+    for path in list(Path(tmp_path).glob("d[0-9]*.json")):
+        payload = json.loads(path.read_text())
+        payload["task"] = "cifar"
+        payload["config"]["task"] = "cifar"
+        payload["config"]["max_len"] = 1024
+        payload["config"]["linformer_k"] = 256
+        
+        if payload["variant"] == "linformer":
+            base = payload["n_params"] - 512_000
+            payload["n_params"] = base + 256 * 1024
+            
+        (Path(tmp_path) / f"cifar_{path.name}").write_text(json.dumps(payload))
+        path.unlink()
+
+    df, report = collect.load_results(tmp_path, phase="full")
+    overhead_failures = [f for f in report.integrity_failures if "overhead" in f]
+    
+    assert not overhead_failures, f"task-aware overhead check false-fired: {overhead_failures}"
+
+
+def test_linformer_wrong_overhead_still_caught_per_task(tmp_path):
+    """Verifies that a genuinely incorrect task-specific parameter overhead is still flagged."""
+    synth.generate(tmp_path, effect=1.0, seed=0)
+    
+    for path in list(Path(tmp_path).glob("d[0-9]*.json")):
+        payload = json.loads(path.read_text())
+        payload["task"] = "cifar"
+        payload["config"]["task"] = "cifar"
+        payload["config"]["max_len"] = 1024
+        payload["config"]["linformer_k"] = 256
+        
+        if payload["variant"] == "linformer":
+            payload["n_params"] += 99
+            
+        (Path(tmp_path) / f"cifar_{path.name}").write_text(json.dumps(payload))
+        path.unlink()
+
+    df, report = collect.load_results(tmp_path, phase="full")
+    
+    assert any("262,144" in f for f in report.integrity_failures)

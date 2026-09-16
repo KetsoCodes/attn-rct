@@ -16,9 +16,10 @@ import pandas as pd
 VARIANTS = ["vanilla", "flash", "linformer", "linear", "sparse"]
 SEEDS = [0, 1, 2]
 N_DESIGNS = 8
-LINFORMER_OVERHEAD = 512_000
 
+# Fields that must remain identical across every cell of a design for the pairing to be valid.
 PAIRING_FIELDS = ["d_model", "depth", "lr", "batch_size", "max_len", "n_heads"]
+LINFORMER_K_FIELD = "linformer_k"
 
 
 @dataclass
@@ -40,26 +41,32 @@ class CollectionReport:
             f"complete blocks      : {len(self.complete_designs)} "
             f"{[f'{t}/d{d:03d}' for t, d in sorted(self.complete_designs)]}",
         ]
+        
         if self.incomplete_designs:
             lines.append(f"incomplete blocks    : {len(self.incomplete_designs)}")
             for (task, design_id), missing in sorted(self.incomplete_designs.items()):
                 lines.append(f"    {task}/d{design_id:03d} missing: {missing}")
+                
         if self.integrity_failures:
             lines.append("integrity failures   :")
             lines.extend(f"    {f}" for f in self.integrity_failures)
+            
         if self.warnings:
             lines.append("warnings             :")
             lines.extend(f"    {w}" for w in self.warnings)
+            
         return "\n".join(lines)
 
 
 def _load_one(path: Path) -> dict:
-    """Parses a single JSON result file into a flat dictionary."""
+    """Parses a single JSON result file into a flattened dictionary."""
     payload = json.loads(path.read_text())
     config = payload.get("config", {})
+    
     row = {
         "run_id": payload.get("run_id"),
         "phase": payload.get("phase"),
+        # Default to 'listops' for older runs before multi-task support was added.
         "task": payload.get("task") or config.get("task", "listops"),
         "design_id": payload.get("design_id"),
         "variant": payload.get("variant"),
@@ -74,8 +81,11 @@ def _load_one(path: Path) -> dict:
         "target_epochs": config.get("epochs"),
         "_source": path.name,
     }
+    
     for f in PAIRING_FIELDS:
         row[f] = config.get(f)
+    row[LINFORMER_K_FIELD] = config.get(LINFORMER_K_FIELD)
+    
     return row
 
 
@@ -138,11 +148,13 @@ def _blocks(df):
 def _check_completeness(df, report):
     """Identifies blocks containing the full expected matrix of variants and seeds."""
     expected = {(v, s) for v in VARIANTS for s in SEEDS}
+    
     for task, design_id in _blocks(df):
         block = df[(df["task"] == task) & (df["design_id"] == design_id)]
         present = set(map(tuple, block[["variant", "seed"]].values))
         missing = expected - present
         key = (task, design_id)
+        
         if missing:
             report.incomplete_designs[key] = sorted(f"{v}_s{s}" for v, s in missing)
         else:
@@ -195,10 +207,24 @@ def _check_params(df, report):
             
         if len(others) == 1 and len(linf) == 1:
             gap = int(linf[0]) - int(others[0])
-            if gap != LINFORMER_OVERHEAD:
+            
+            # Linformer's shared projection costs k * max_len parameters. The expected 
+            # overhead is task-dependent (e.g., 512,000 for ListOps, 262,144 for CIFAR).
+            k_values = block[LINFORMER_K_FIELD].dropna().unique()
+            max_len_values = block["max_len"].dropna().unique()
+            
+            if len(k_values) == 1 and len(max_len_values) == 1:
+                expected = int(k_values[0]) * int(max_len_values[0])
+                if gap != expected:
+                    report.integrity_failures.append(
+                        f"{tag}: linformer overhead is {gap:,}, "
+                        f"expected {expected:,} (k={int(k_values[0])} x "
+                        f"max_len={int(max_len_values[0])})"
+                    )
+            elif gap <= 0:
                 report.integrity_failures.append(
-                    f"{tag}: linformer overhead is {gap:,}, "
-                    f"expected {LINFORMER_OVERHEAD:,}"
+                    f"{tag}: linformer overhead is {gap:,}; expected a positive "
+                    "k * max_len and could not verify the exact value"
                 )
 
 
