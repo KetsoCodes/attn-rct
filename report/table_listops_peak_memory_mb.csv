@@ -1,0 +1,6 @@
+variant,mean_rank,is_baseline,p_adjusted,significant_vs_baseline,cohens_dz,ci_low,ci_high,geometric_ratio,favours
+flash,1.0,True,,,,,,,
+linear,2.0,False,0.2059,False,3.249,2.607,5.979,0.916,flash
+linformer,3.0,False,0.0152,True,4.705,4.437,7.866,0.85,flash
+vanilla,4.0,False,0.0003,True,5.841,5.378,9.181,0.353,flash
+sparse,5.0,False,0.0,True,5.775,5.336,9.131,0.342,flash
