@@ -1,8 +1,18 @@
-"""Generates a CSV manifest mapping Slurm array indices to specific training configurations.
+"""Build the run manifest: one CSV row per (task, design, variant, seed) cell.
 
-This script ensures every combination of task, architectural design, attention variant,
-and random seed is explicitly defined before execution. The resulting manifest allows
-for reproducible job submissions and clean data joining during statistical analysis.
+The Slurm array index is just an integer, and mapping it to a configuration inside the
+job script would put that mapping in bash where it cannot be inspected or diffed. A CSV
+written up front lets us see exactly what will run before spending the GPU hours, re-run
+a failed task by index into an identical configuration, and join results back to designs
+in the analysis without re-deriving anything.
+
+A *design* is a meaningful architectural configuration -- depth, width, lr. A *seed* is
+noise control: seeds are averaged within a cell and are NOT independent observations. A
+*task* is a dataset/objective; the study generalises over tasks as well as designs, so
+the same design space runs under every task and the analysis blocks on (task, design).
+
+Every (task, design) runs under every variant, because the Demsar pipeline needs a
+complete matrix -- one missing cell drops that whole block from the analysis.
 """
 
 from __future__ import annotations
@@ -12,49 +22,71 @@ import csv
 import itertools
 import json
 
+# Order is fixed so array indices stay stable across regenerations.
 VARIANTS = ["vanilla", "flash", "linformer", "linear", "sparse"]
 
+# d_model starts at 256, not 128. Linformer's shared E costs a fixed k * max_len
+# parameters regardless of depth, ~1.14x the total at this floor but ~2.95x at 128.
 DESIGN_SPACE = {
     "d_model": [256, 384],
     "depth": [4, 6],
     "lr": [3e-4, 1e-3],
+    # batch 16, not 32: at 32 the memory probe put vanilla at 97% of a 24GB card at
+    # depth 6 and sparse OOM'd outright. 16 leaves the worst cell at ~53%.
     "batch_size": [16],
 }
 
 SEEDS = [0, 1, 2]
 
+# Per-task configuration. Each task fixes its own sequence length and data directory,
+# because these are properties of the dataset, not of the design space. The attention
+# mechanism is the only thing that varies within a (task, design); everything here is
+# held constant across the arms of a cell.
 TASKS = {
     "listops": {
         "max_len": 2000,
         "data_dir": "/datasets/fmnisi/lra/listops",
     },
     "cifar": {
+        # CIFAR-10 Image task is fixed-length 32x32 = 1024, so nothing is filtered or
+        # truncated -- the length-cap that limits ListOps accuracy does not apply.
         "max_len": 1024,
         "data_dir": "/datasets/fmnisi/cifar",
     },
+    "pathfinder": {
+        # Pathfinder32 is also fixed-length 32x32 = 1024. It is the task where approximate
+        # attention is reported to struggle most, so it is the sharpest test of whether the
+        # accuracy ranking from the other tasks holds.
+        "max_len": 1024,
+        "data_dir": "/datasets/fmnisi/pathfinder",
+    },
 }
 
+# Held constant across every task, design, and arm -- the fixed frame.
 FIXED = {
     "n_heads": 8,
     "linformer_k": 256,
     "linformer_sharing": "layerwise",
-    "attn_dropout": 0.0,
+    "attn_dropout": 0.0,   # ADR-001
     "dropout": 0.1,
     "sparse_pattern": "fixed",
+    # 45 = round(sqrt(2000)), resolved against ListOps' max_len rather than the padded
+    # batch length. Fixed-length tasks pad nothing, so the stride is inert there anyway.
     "sparse_stride": 45,
     "compute_dtype": "bf16",
     "epochs": 20,
 }
 
+# bigbatch allows 6 running / 48 submitted jobs per user.
 MAX_CONCURRENT = 6
 MAX_SUBMIT = 48
 
 
 def build_designs():
-    """Enumerates the architectural design space in a stable, deterministic order.
+    """Enumerate the design space in a stable order.
 
     Yields:
-        Tuple of (design_id, design_dictionary) where d_ff is dynamically derived.
+        (design_id, design dict) pairs, with d_ff derived from d_model.
     """
     keys = sorted(DESIGN_SPACE)
     for i, values in enumerate(itertools.product(*(DESIGN_SPACE[k] for k in keys))):
@@ -76,13 +108,16 @@ def main():
 
     designs = list(build_designs())
     rows = []
-
+    # Task is the outermost loop so a task's rows are contiguous, which makes it easy to
+    # submit or re-run one task's block of array indices.
     for task in args.tasks:
         task_cfg = TASKS[task]
         for (design_id, design), variant, seed in itertools.product(
             designs, VARIANTS, SEEDS
         ):
             rows.append({
+                # Task in the run_id keeps result filenames and W&B ids unique across
+                # tasks: cifar_d000_flash_s0 never collides with listops_d000_flash_s0.
                 "run_id": f"{task}_d{design_id:03d}_{variant}_s{seed}",
                 "task": task,
                 "design_id": design_id,
@@ -102,7 +137,6 @@ def main():
     n_tasks = len(args.tasks)
     n_designs, n_variants, n_seeds = len(designs), len(VARIANTS), len(SEEDS)
     n_blocks = n_tasks * n_designs
-    
     print(f"tasks          : {n_tasks}  {args.tasks}")
     print(f"designs/task   : {n_designs}")
     print(f"variants       : {n_variants}  {VARIANTS}")
