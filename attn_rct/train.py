@@ -1,8 +1,11 @@
-"""Training entry point for a single experimental run.
+"""Training entry point for a single (design, variant, seed) experimental cell.
 
-Maps a Slurm array index to a specific configuration in the manifest. Handles 
-periodic checkpointing and cluster preemption signals to ensure training can 
-safely resume without losing random state parity. Outputs final metrics to a JSON file.
+Executes a single training run where the Slurm array index maps to a specific 
+configuration in the manifest. Includes periodic checkpointing and clean signal 
+handling to survive cluster preemption, ensuring RNG state is preserved for 
+strict experimental pairing.
+
+Writes a single JSON file containing averaged metrics upon completion.
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ EXIT_REQUEUE = 42
 
 
 def handle_signal(signum, frame):
-    """Triggers a clean exit and checkpoint upon receiving a cluster kill signal."""
+    """Flags when a Slurm walltime warning or kill signal is received for a clean exit."""
     global INTERRUPTED
     print(f"\n[signal {signum}] walltime approaching -- checkpointing and exiting",
           flush=True)
@@ -41,15 +44,15 @@ def parse_args():
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--row", type=int, required=True)
     parser.add_argument("--data-dir", default=None,
-                        help="overrides the manifest's per-task data_dir if given")
+                        help="Overrides the manifest's per-task data_dir if given")
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--result-file", required=True)
     parser.add_argument("--checkpoint-every-min", type=float, default=30.0)
     parser.add_argument("--require-flash", action="store_true",
-                        help="fail loudly if the true FA-2 path is unreachable")
-    parser.add_argument("--epochs", type=int, default=None, help="override the manifest")
+                        help="Fail loudly if the true FA-2 path is unreachable")
+    parser.add_argument("--epochs", type=int, default=None, help="Override the manifest")
     parser.add_argument("--limit-batches", type=int, default=None,
-                        help="smoke-test only: cap batches per epoch")
+                        help="Smoke-test only: cap batches per epoch")
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--phase", default="pilot", choices=["smoke", "pilot", "full"],
                         help="Categorises runs to separate throwaway tests from reportable data")
@@ -57,13 +60,17 @@ def parse_args():
     parser.add_argument("--max-len", type=int, default=None)
     parser.add_argument("--d-model", type=int, default=None)
     parser.add_argument("--depth", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None, help="Override the manifest")
+    parser.add_argument("--warmup-steps", type=int, default=None,
+                        help="Linear LR warmup over this many steps; 0 disables it")
     return parser.parse_args()
 
 
 def load_manifest_row(manifest: Path, row_index: int) -> SimpleNamespace:
-    """Reads and types a specific row from the manifest CSV."""
+    """Reads a specific row from the manifest CSV and casts numerical fields appropriately."""
     with open(manifest, newline="") as handle:
         rows = list(csv.DictReader(handle))
+        
     if not 1 <= row_index <= len(rows):
         raise IndexError(f"row {row_index} out of range; manifest has {len(rows)} rows")
 
@@ -78,6 +85,7 @@ def load_manifest_row(manifest: Path, row_index: int) -> SimpleNamespace:
                 continue
         else:
             typed[key] = value
+            
     return SimpleNamespace(**typed)
 
 
@@ -88,20 +96,61 @@ def resolve_config(args) -> SimpleNamespace:
 
     if args.epochs is not None:
         cfg.epochs = args.epochs
-    for name in ("batch_size", "max_len", "d_model", "depth"):
+        
+    for name in ("batch_size", "max_len", "d_model", "depth", "lr"):
         override = getattr(args, name)
         if override is not None:
-            print(f"[override] {name}: {getattr(cfg, name)} -> {override}")
+            print(f"[override] {name}: {getattr(cfg, name, None)} -> {override}")
             setattr(cfg, name, override)
+            
     if args.d_model is not None:
         cfg.d_ff = 4 * cfg.d_model
+
+    # Warmup defaults to OFF so every run made before it existed is reproduced exactly.
+    # A manifest may carry warmup_steps per task; the flag overrides it.
+    if args.warmup_steps is not None:
+        print(f"[override] warmup_steps: "
+              f"{getattr(cfg, 'warmup_steps', 0)} -> {args.warmup_steps}")
+        cfg.warmup_steps = args.warmup_steps
+    elif not hasattr(cfg, "warmup_steps"):
+        cfg.warmup_steps = 0
 
     cfg.require_flash = args.require_flash
     return cfg
 
 
+def apply_warmup(optimizer, base_lr: float, global_step: int, warmup_steps: int) -> float:
+    """Linearly ramps the learning rate from 0 to base_lr over the first warmup_steps.
+
+    Transformers on some tasks (like Pathfinder) sit at chance for the whole run 
+    without a warmup, because the first large updates land before attention has 
+    organised. A plain linear ramp is the LRA reference recipe's mechanism.
+
+    With warmup_steps == 0, the optimizer is left untouched, reproducing older runs exactly.
+
+    Args:
+        optimizer: The optimizer whose param groups carry the learning rate.
+        base_lr: The configured learning rate target.
+        global_step: Steps completed since the start of training (not just this session).
+        warmup_steps: Length of the ramp; 0 disables it.
+
+    Returns:
+        The learning rate currently in effect, for logging purposes.
+    """
+    if not warmup_steps:
+        return base_lr
+        
+    scale = min(1.0, (global_step + 1) / float(warmup_steps))
+    lr = base_lr * scale
+    
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+        
+    return lr
+
+
 def serialisable_config(cfg) -> dict:
-    """Returns a JSON-safe dictionary of the configuration, filtering out private attributes."""
+    """Returns a JSON-safe dictionary of the configuration, omitting private attributes."""
     return {k: v for k, v in vars(cfg).items() if not k.startswith("_")}
 
 
@@ -111,6 +160,7 @@ def evaluate(model, loader, device, limit_batches=None):
     correct = total = 0
     loss_sum = 0.0
     criterion = nn.CrossEntropyLoss()
+    
     with torch.no_grad():
         for i, (tokens, mask, targets) in enumerate(loader):
             if limit_batches and i >= limit_batches:
@@ -120,6 +170,7 @@ def evaluate(model, loader, device, limit_batches=None):
             loss_sum += criterion(logits, targets).item() * targets.size(0)
             correct += (logits.argmax(dim=-1) == targets).sum().item()
             total += targets.size(0)
+            
     model.train()
     return correct / max(total, 1), loss_sum / max(total, 1)
 
@@ -140,13 +191,14 @@ def save_checkpoint(path, model, optimizer, epoch, best_accuracy):
 
 
 def resume(checkpoint_path, model, optimizer, device):
-    """Restores model weights, optimizer state, and RNG state if a checkpoint exists."""
+    """Restores model weights, optimizer, and RNG state if a checkpoint exists."""
     if not checkpoint_path.exists():
         return 0, 0.0
 
     state = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(state["model"])
     optimizer.load_state_dict(state["optimizer"])
+    
     torch.set_rng_state(state["cpu_rng"].cpu())
     if state["cuda_rng"] is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda_rng"]])
@@ -154,13 +206,13 @@ def resume(checkpoint_path, model, optimizer, device):
     start_epoch = state["epoch"] + 1
     best_accuracy = state["best_accuracy"]
     print(f"[resume] from epoch {start_epoch}, best acc {best_accuracy:.4f}")
+    
     return start_epoch, best_accuracy
 
 
 def start_wandb(args, cfg, n_params, vocab_size):
     """Initialises Weights & Biases logging if credentials are provided."""
-    enabled = (os.environ.get("WANDB_API_KEY")
-               or os.environ.get("WANDB_MODE") == "offline")
+    enabled = (os.environ.get("WANDB_API_KEY") or os.environ.get("WANDB_MODE") == "offline")
     if not enabled:
         return None
 
@@ -222,17 +274,21 @@ def main():
 
     cfg = resolve_config(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     print(f"=== {cfg.run_id} | variant={cfg.variant} | seed={cfg.seed} | {device} ===")
     print(f"config: {vars(cfg)}")
 
+    # Command line --data-dir overrides manifest data_dir (useful for smoke tests).
     data_dir = args.data_dir or getattr(cfg, "data_dir", None)
     if data_dir is None:
         raise SystemExit(
             "no data directory: pass --data-dir or include data_dir in the manifest"
         )
+        
     train_loader, val_loader, meta = build_dataloaders(
         cfg.task, data_dir, cfg.max_len, cfg.batch_size, cfg.seed, args.num_workers,
     )
+    
     print(f"task: {cfg.task} | vocab: {meta['vocab_size']} | "
           f"classes: {meta['n_classes']} | train batches: {len(train_loader)} "
           f"| val batches: {len(val_loader)}")
@@ -240,6 +296,7 @@ def main():
     torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.seed)
+        
     model = TransformerClassifier(
         cfg, vocab_size=meta["vocab_size"], n_classes=meta["n_classes"]
     ).to(device)
@@ -269,6 +326,16 @@ def main():
     last_checkpoint = time.time()
     history = []
     
+    # Warmup is driven by global steps so a resumed run continues the ramp accurately.
+    base_lr = float(cfg.lr)
+    warmup_steps = int(getattr(cfg, "warmup_steps", 0) or 0)
+    batches_per_epoch = len(train_loader)
+    current_lr = base_lr
+    
+    if warmup_steps:
+        print(f"[warmup] linear ramp to lr={base_lr} over {warmup_steps} steps "
+              f"({warmup_steps / max(batches_per_epoch, 1):.2f} epochs)")
+
     for epoch in range(start_epoch, int(cfg.epochs)):
         model.train()
         epoch_start = time.time()
@@ -277,8 +344,13 @@ def main():
         for i, (tokens, mask, targets) in enumerate(train_loader):
             if args.limit_batches and i >= args.limit_batches:
                 break
+                
             tokens, mask, targets = tokens.to(device), mask.to(device), targets.to(device)
 
+            current_lr = apply_warmup(
+                optimizer, base_lr, epoch * batches_per_epoch + i, warmup_steps
+            )
+            
             optimizer.zero_grad(set_to_none=True)
             loss = criterion(model(tokens, mask), targets)
             loss.backward()
@@ -310,9 +382,12 @@ def main():
             "val_loss": val_loss,
             "val_accuracy": val_accuracy,
             "train_seconds": train_time,
+            "lr": current_lr,
         }
+        
         if torch.cuda.is_available():
             record["peak_memory_mb"] = torch.cuda.max_memory_allocated() / 1e6
+            
         history.append(record)
         print(f"epoch {epoch}: {record}", flush=True)
         if run:
