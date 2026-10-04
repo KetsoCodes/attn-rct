@@ -24,3 +24,5 @@ wandb/
 .vscode/
 .idea/
 cluster/runs.csv
+kaggle.json
+**/kaggle.json
