@@ -1,8 +1,14 @@
-"""Collects and validates experimental result files into a structured dataset.
+"""Collect results/*.json into a tidy table, refusing to proceed on a broken matrix.
 
-Ensures data integrity by verifying that only completely executed experimental blocks 
-(all variants and seeds for a given task and design) are passed forward. This stage 
-strictly flags or drops incomplete or corrupted matrices before statistical analysis begins.
+The Friedman test needs a complete design x variant matrix: a single missing cell drops
+the whole design. The dangerous failure is not a crash but silent partial data -- if 37 of
+40 cells are present, the test might run happily, but the reported N is not the N you think. 
+So here we want to determine if the matrix is complete, and refuse to load it if it isn't.
+
+This returns a long DataFrame (one row per design, variant, and seed), plus a report of 
+what was excluded and why. Nothing here averages or ranks; that happens in aggregate.py. 
+The split matters because every exclusion decision should be visible before any statistic 
+is computed.
 """
 
 from __future__ import annotations
@@ -13,44 +19,42 @@ from pathlib import Path
 
 import pandas as pd
 
+# What a complete grid looks like, mirrored from make_manifest.py.
 VARIANTS = ["vanilla", "flash", "linformer", "linear", "sparse"]
 SEEDS = [0, 1, 2]
 N_DESIGNS = 8
 
-# Fields that must remain identical across every cell of a design for the pairing to be valid.
+# Fields that must agree across every cell of one design for the pairing to hold. 
+# If two cells of the same design differ on any of these, the pairing is broken.
 PAIRING_FIELDS = ["d_model", "depth", "lr", "batch_size", "max_len", "n_heads"]
 LINFORMER_K_FIELD = "linformer_k"
 
 
 @dataclass
 class CollectionReport:
-    """Tracks the status of loaded results, including dropped blocks and integrity warnings."""
+    """Tracks what was found, what was dropped, and why."""
 
     n_files: int = 0
     n_rows: int = 0
     complete_designs: list = field(default_factory=list)
-    incomplete_designs: dict = field(default_factory=dict)
-    integrity_failures: list = field(default_factory=list)
+    incomplete_designs: dict = field(default_factory=dict)   # design_id -> missing cells
+    integrity_failures: list = field(default_factory=list)   # human-readable strings
     warnings: list = field(default_factory=list)
 
     def summary(self) -> str:
-        """Generates a formatted summary of the collection process."""
         lines = [
             f"files read           : {self.n_files}",
             f"rows                 : {self.n_rows}",
             f"complete blocks      : {len(self.complete_designs)} "
             f"{[f'{t}/d{d:03d}' for t, d in sorted(self.complete_designs)]}",
         ]
-        
         if self.incomplete_designs:
             lines.append(f"incomplete blocks    : {len(self.incomplete_designs)}")
             for (task, design_id), missing in sorted(self.incomplete_designs.items()):
                 lines.append(f"    {task}/d{design_id:03d} missing: {missing}")
-                
         if self.integrity_failures:
             lines.append("integrity failures   :")
             lines.extend(f"    {f}" for f in self.integrity_failures)
-            
         if self.warnings:
             lines.append("warnings             :")
             lines.extend(f"    {w}" for w in self.warnings)
@@ -58,15 +62,25 @@ class CollectionReport:
         return "\n".join(lines)
 
 
+# A result file must carry all of these to uniquely identify its cell.
+# Anything missing one is likely a probe or stray JSON sharing the directory.
+RESULT_SIGNATURE = ["run_id", "phase", "task", "design_id", "variant", "seed"]
+
+
+def _is_result_file(row: dict) -> bool:
+    """Checks if this payload is an actual training result."""
+    return all(row.get(field) is not None for field in RESULT_SIGNATURE)
+
+
 def _load_one(path: Path) -> dict:
-    """Parses a single JSON result file into a flattened dictionary."""
+    """Reads one result file and flattens the necessary fields into a flat row."""
     payload = json.loads(path.read_text())
     config = payload.get("config", {})
     
     row = {
         "run_id": payload.get("run_id"),
         "phase": payload.get("phase"),
-        # Default to 'listops' for older runs before multi-task support was added.
+        # Fall back to config then historical default for older ListOps runs
         "task": payload.get("task") or config.get("task", "listops"),
         "design_id": payload.get("design_id"),
         "variant": payload.get("variant"),
@@ -90,35 +104,37 @@ def _load_one(path: Path) -> dict:
 
 
 def load_results(results_dir, phase="full") -> tuple[pd.DataFrame, CollectionReport]:
-    """Loads all valid result files for a given phase into a DataFrame.
+    """Loads every result file for a given phase into a long DataFrame.
 
     Args:
         results_dir: Directory containing the JSON result files.
-        phase: Filters rows by phase to exclude throwaway/smoke runs.
+        phase: Filters rows so throwaway smoke runs don't contaminate the report.
 
     Returns:
-        A tuple containing the results DataFrame and a CollectionReport detailing 
-        any integrity or completeness findings.
+        (df, report). The report records completeness and integrity findings. 
+        It does NOT raise errors here -- `require_complete` handles that.
     """
     results_dir = Path(results_dir)
     report = CollectionReport()
-
     rows = []
-    patterns = ["listops_*.json", "cifar_*.json", "d[0-9]*.json"]
-    candidates = sorted(
-        {path for pattern in patterns for path in results_dir.glob(pattern)}
-    )
     
-    for path in candidates:
+    # We recognize result files by their payload rather than a rigid filename glob.
+    # This prevents new tasks (like Pathfinder) from being silently ignored.
+    for path in sorted(results_dir.glob("*.json")):
         try:
             row = _load_one(path)
-        except (json.JSONDecodeError, KeyError) as err:
+        except json.JSONDecodeError as err:
             report.warnings.append(f"could not parse {path.name}: {err}")
             continue
             
+        if not _is_result_file(row):
+            continue
+            
         report.n_files += 1
+        
         if row["phase"] != phase:
             continue
+            
         rows.append(row)
 
     df = pd.DataFrame(rows)
@@ -138,15 +154,14 @@ def load_results(results_dir, phase="full") -> tuple[pd.DataFrame, CollectionRep
 
 
 def _blocks(df):
-    """Yields unique (task, design_id) combinations present in the dataset."""
-    seen = df[["task", "design_id"]].drop_duplicates()
-    seen = seen.sort_values(["task", "design_id"])
+    """Yields (task, design_id) block keys present in the table in a stable order."""
+    seen = df[["task", "design_id"]].drop_duplicates().sort_values(["task", "design_id"])
     for _, r in seen.iterrows():
         yield r["task"], int(r["design_id"])
 
 
 def _check_completeness(df, report):
-    """Identifies blocks containing the full expected matrix of variants and seeds."""
+    """Records which (task, design) blocks have all 5 variants x 3 seeds."""
     expected = {(v, s) for v in VARIANTS for s in SEEDS}
     
     for task, design_id in _blocks(df):
@@ -162,7 +177,11 @@ def _check_completeness(df, report):
 
 
 def _check_partial_training(df, report):
-    """Flags runs that completed fewer epochs than targeted, as timing metrics may be skewed."""
+    """Flags cells whose timing reflects fewer epochs than intended.
+
+    Requeued runs report timing over only THIS session's epochs. This doesn't corrupt 
+    accuracy, but it skews efficiency numbers, so we flag it instead of silently averaging.
+    """
     for _, r in df.iterrows():
         trained, target = r["epochs_trained_this_session"], r["target_epochs"]
         if trained is not None and target is not None and trained < target:
@@ -173,7 +192,7 @@ def _check_partial_training(df, report):
 
 
 def _check_pairing(df, report):
-    """Ensures all runs within a block share identical architectural configurations."""
+    """Ensures every cell in a block agrees on the pairing fields to remain valid."""
     for task, design_id in _blocks(df):
         block = df[(df["task"] == task) & (df["design_id"] == design_id)]
         for f in PAIRING_FIELDS:
@@ -186,7 +205,7 @@ def _check_pairing(df, report):
 
 
 def _check_params(df, report):
-    """Verifies parameter count consistency within blocks, accounting for Linformer's overhead."""
+    """Verifies non-Linformer arms share a param count and Linformer has its expected overhead."""
     for task, design_id in _blocks(df):
         block = df[(df["task"] == task) & (df["design_id"] == design_id)]
         tag = f"{task} d{design_id:03d}"
@@ -207,9 +226,6 @@ def _check_params(df, report):
             
         if len(others) == 1 and len(linf) == 1:
             gap = int(linf[0]) - int(others[0])
-            
-            # Linformer's shared projection costs k * max_len parameters. The expected 
-            # overhead is task-dependent (e.g., 512,000 for ListOps, 262,144 for CIFAR).
             k_values = block[LINFORMER_K_FIELD].dropna().unique()
             max_len_values = block["max_len"].dropna().unique()
             
@@ -218,8 +234,7 @@ def _check_params(df, report):
                 if gap != expected:
                     report.integrity_failures.append(
                         f"{tag}: linformer overhead is {gap:,}, "
-                        f"expected {expected:,} (k={int(k_values[0])} x "
-                        f"max_len={int(max_len_values[0])})"
+                        f"expected {expected:,} (k={int(k_values[0])} x max_len={int(max_len_values[0])})"
                     )
             elif gap <= 0:
                 report.integrity_failures.append(
@@ -229,7 +244,7 @@ def _check_params(df, report):
 
 
 def _check_backend(df, report):
-    """Ensures all FlashAttention runs utilized the verified hardware-accelerated backend."""
+    """Ensures every Flash cell took the verified FA-2 path."""
     flash = df[df["variant"] == "flash"]
     for _, r in flash.iterrows():
         backend = r["backend"] or ""
@@ -241,10 +256,12 @@ def _check_backend(df, report):
 
 
 def require_complete(df, report, drop_incomplete=True):
-    """Filters the DataFrame to return only fully complete and intact experimental blocks.
+    """Returns only analysable designs, raising errors if integrity checks fail.
 
-    Raises:
-        ValueError: On any integrity failure, or if no complete designs remain.
+    Args:
+        df: The long DataFrame from load_results.
+        report: The corresponding CollectionReport.
+        drop_incomplete: Silently drops incomplete designs if True. Raises error if False.
     """
     if report.integrity_failures:
         raise ValueError(

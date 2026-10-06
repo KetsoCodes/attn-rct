@@ -1,7 +1,9 @@
-"""Unit tests for the data collection and integrity-checking stage.
+"""Tests for the collection and integrity-checking stage.
 
-Ensures that the collection logic strictly rejects incomplete, corrupted, or 
-incompatible experimental data matrices before statistical analysis begins.
+These lean on the synthetic generator, which writes results in train.py's exact schema.
+The point of most of them is that the checks REFUSE bad data: a check that never fires is
+worse than no check, because it looks like safety. So each integrity test deliberately
+corrupts one thing and asserts the corresponding failure is raised.
 """
 
 import json
@@ -14,13 +16,13 @@ from attn_rct.analysis import collect, synth
 
 @pytest.fixture
 def full_grid(tmp_path):
-    """Generates a complete synthetic results grid for testing."""
+    """A complete synthetic grid with a planted effect."""
     synth.generate(tmp_path, effect=1.0, seed=0)
     return tmp_path
 
 
 def corrupt(directory, run_id, mutate):
-    """Modifies a specific JSON result file to simulate data corruption."""
+    """Apply mutate() to one result file's parsed JSON and write it back."""
     path = Path(directory) / f"{run_id}.json"
     payload = json.loads(path.read_text())
     mutate(payload)
@@ -28,7 +30,7 @@ def corrupt(directory, run_id, mutate):
 
 
 def test_full_grid_is_complete(full_grid):
-    """Verifies that a perfectly complete grid loads all rows and designs without errors."""
+    """A clean grid loads 120 rows, 8 complete designs, no failures."""
     df, report = collect.load_results(full_grid, phase="full")
     assert report.n_rows == 120
     assert sorted(report.complete_designs) == [('listops', i) for i in range(8)]
@@ -39,19 +41,18 @@ def test_full_grid_is_complete(full_grid):
 
 
 def test_phase_filter_excludes_other_phases(full_grid):
-    """Ensures that runs from other phases (e.g., 'smoke') are ignored to prevent contamination."""
+    """Rows from another phase are not loaded, so smoke runs never contaminate."""
     corrupt(full_grid, "d000_flash_s0", lambda p: p.update(phase="smoke"))
     df, report = collect.load_results(full_grid, phase="full")
-    
+    # d000 flash s0 is now phase=smoke, so d000 is incomplete under phase=full.
     assert ("listops", 0) in report.incomplete_designs
     assert "flash_s0" in report.incomplete_designs[("listops", 0)]
 
 
 def test_incomplete_design_is_dropped_not_analysed(full_grid):
-    """Checks that a single missing cell correctly invalidates its entire design block."""
+    """A missing cell drops its whole design; the rest remain analysable."""
     (Path(full_grid) / "d004_vanilla_s2.json").unlink()
     df, report = collect.load_results(full_grid, phase="full")
-    
     assert ("listops", 4) in report.incomplete_designs
     keep = collect.require_complete(df, report, drop_incomplete=True)
     assert 4 not in keep["design_id"].unique()
@@ -59,88 +60,85 @@ def test_incomplete_design_is_dropped_not_analysed(full_grid):
 
 
 def test_incomplete_is_hard_error_when_not_dropping(full_grid):
-    """Ensures the collector raises a fatal error on incomplete blocks when strict mode is enforced."""
+    """With drop_incomplete=False, any hole is fatal."""
     (Path(full_grid) / "d004_sparse_s1.json").unlink()
     df, report = collect.load_results(full_grid, phase="full")
-    
     with pytest.raises(ValueError, match="incomplete blocks"):
         collect.require_complete(df, report, drop_incomplete=False)
 
 
 def test_broken_pairing_is_caught(full_grid):
-    """Verifies that varying architectural configurations within the same design block trigger a failure."""
-    corrupt(full_grid, "d001_vanilla_s0", lambda p: p["config"].update(depth=99))
+    """A design whose cells disagree on a pairing field is invalid."""
+    corrupt(full_grid, "d001_vanilla_s0",
+            lambda p: p["config"].update(depth=99))
     df, report = collect.load_results(full_grid, phase="full")
-    
     assert any("pairing is broken" in f for f in report.integrity_failures)
     with pytest.raises(ValueError, match="integrity checks failed"):
         collect.require_complete(df, report)
 
 
 def test_unverified_flash_backend_is_caught(full_grid):
-    """Ensures FlashAttention runs are flagged if they fallback to an unverified backend."""
-    corrupt(full_grid, "d000_flash_s0", lambda p: p.update(backend="sdpa fallback NOT fa2"))
+    """A flash cell that did not take the FA-2 path is flagged."""
+    corrupt(full_grid, "d000_flash_s0",
+            lambda p: p.update(backend="sdpa fallback NOT fa2"))
     df, report = collect.load_results(full_grid, phase="full")
-    
     assert any("backend not verified" in f for f in report.integrity_failures)
 
 
 def test_nonlinformer_param_drift_is_caught(full_grid):
-    """Verifies that parameter count inconsistencies across non-Linformer models trigger an error."""
-    corrupt(full_grid, "d003_vanilla_s0", lambda p: p.update(n_params=p["n_params"] + 1000))
+    """Non-linformer arms in a design must share a parameter count."""
+    corrupt(full_grid, "d003_vanilla_s0",
+            lambda p: p.update(n_params=p["n_params"] + 1000))
     df, report = collect.load_results(full_grid, phase="full")
-    
     assert any("disagree on n_params" in f for f in report.integrity_failures)
 
 
 def test_linformer_overhead_wrong_is_caught(full_grid):
-    """Checks that an incorrect parameter overhead for Linformer models is flagged."""
+    """If every linformer cell shares a wrong overhead, the gap check catches it."""
     for seed in (0, 1, 2):
-        corrupt(full_grid, f"d002_linformer_s{seed}", lambda p: p.update(n_params=p["n_params"] + 10_000))
+        corrupt(full_grid, f"d002_linformer_s{seed}",
+                lambda p: p.update(n_params=p["n_params"] + 10_000))
     df, report = collect.load_results(full_grid, phase="full")
-    
     assert any("overhead" in f for f in report.integrity_failures)
 
 
 def test_linformer_disagrees_across_seeds_is_caught(full_grid):
-    """Ensures that parameter count drift across random seeds for Linformer triggers an error."""
-    corrupt(full_grid, "d002_linformer_s0", lambda p: p.update(n_params=p["n_params"] + 1))
+    """If only one linformer seed drifts, the cross-seed check catches it."""
+    corrupt(full_grid, "d002_linformer_s0",
+            lambda p: p.update(n_params=p["n_params"] + 1))
     df, report = collect.load_results(full_grid, phase="full")
-    
     assert any("disagree on n_params" in f for f in report.integrity_failures)
 
 
 def test_partial_training_is_warned(full_grid):
-    """Verifies that prematurely terminated runs log a warning instead of failing silently."""
-    corrupt(full_grid, "d000_linear_s0", lambda p: p.update(epochs_trained_this_session=5))
+    """A cell that trained fewer epochs than the target is flagged, not silently kept."""
+    corrupt(full_grid, "d000_linear_s0",
+            lambda p: p.update(epochs_trained_this_session=5))
     df, report = collect.load_results(full_grid, phase="full")
-    
     assert any("partial run" in w for w in report.warnings)
 
 
 def test_null_effect_still_loads_cleanly(tmp_path):
-    """Ensures grids with no statistical effect size still load and process correctly."""
+    """The null case (no true difference) is structurally identical; only values differ."""
     synth.generate(tmp_path, effect=0.0, seed=3)
     df, report = collect.load_results(tmp_path, phase="full")
-    
     assert report.n_rows == 120
     assert not report.integrity_failures
 
 
 def test_empty_directory_is_handled(tmp_path):
-    """Checks that pointing the collector to an empty directory logs a warning rather than crashing."""
+    """No files is a warning and an empty frame, not a crash."""
     df, report = collect.load_results(tmp_path, phase="full")
-    
     assert df.empty
     assert any("no rows" in w for w in report.warnings)
     with pytest.raises(ValueError):
         collect.require_complete(df, report)
 
 
-# ---- Multi-tasking ----
+# ---- multi-task: blocks are (task, design), not design alone ----
 
 def _stamp_task(directory, task, prefix, drop=()):
-    """Renames a synthetic grid's files with a task prefix and injects the task field into the JSON."""
+    """Rename a synthetic grid's files with a task prefix and stamp the task field."""
     for path in list(Path(directory).glob("d[0-9]*.json")):
         payload = json.loads(path.read_text())
         payload["task"] = task
@@ -153,94 +151,171 @@ def _stamp_task(directory, task, prefix, drop=()):
 
 
 def test_two_tasks_are_distinct_blocks(tmp_path):
-    """Ensures identical design indices from different tasks are treated as completely distinct blocks."""
+    """The same design index under two tasks is two blocks, not one merged block."""
     synth.generate(tmp_path, effect=1.0, seed=0)
     _stamp_task(tmp_path, "listops", "listops_")
     synth.generate(tmp_path, effect=1.0, seed=1)
     _stamp_task(tmp_path, "cifar", "cifar_")
 
     df, report = collect.load_results(tmp_path, phase="full")
-    
     assert sorted(df["task"].unique()) == ["cifar", "listops"]
+    # 16 complete blocks: 8 designs x 2 tasks, none merged.
     assert len(report.complete_designs) == 16
     assert ("listops", 4) in report.complete_designs
     assert ("cifar", 4) in report.complete_designs
 
 
 def test_incomplete_block_in_one_task_does_not_drop_the_other(tmp_path):
-    """Verifies that an incomplete block in one task does not invalidate the corresponding block in another."""
+    """A hole in cifar/d004 must not remove listops/d004, now that they are separate."""
     synth.generate(tmp_path, effect=1.0, seed=0)
     _stamp_task(tmp_path, "listops", "listops_")
     synth.generate(tmp_path, effect=1.0, seed=1)
     _stamp_task(tmp_path, "cifar", "cifar_", drop=("cifar_d004_sparse_s1.json",))
 
     df, report = collect.load_results(tmp_path, phase="full")
-    
     assert ("cifar", 4) in report.incomplete_designs
     assert ("listops", 4) in report.complete_designs
-    
     keep = collect.require_complete(df, report)
     kept_blocks = set(zip(keep["task"], keep["design_id"]))
-    
     assert ("listops", 4) in kept_blocks
     assert ("cifar", 4) not in kept_blocks
 
 
 def test_task_defaults_to_listops_for_old_results(tmp_path):
-    """Ensures backwards compatibility by defaulting older result files to the 'listops' task."""
+    """Results predating the task field are read as listops, their only possible task."""
     synth.generate(tmp_path, effect=1.0, seed=0)
     for path in Path(tmp_path).glob("d[0-9]*.json"):
         payload = json.loads(path.read_text())
         payload.pop("task", None)
         payload["config"].pop("task", None)
         path.write_text(json.dumps(payload))
-        
     df, _ = collect.load_results(tmp_path, phase="full")
-    
     assert (df["task"] == "listops").all()
 
 
 def test_linformer_overhead_is_task_aware(tmp_path):
-    """Ensures the Linformer overhead check correctly computes expected parameters per task."""
+    """Linformer overhead is k*max_len, so a task with a different max_len is not a failure.
+
+    CIFAR runs at max_len 1024, giving overhead 256*1024 = 262,144, not ListOps' 512,000.
+    The check must compute the expectation from the block, not hardcode one task's value.
+    """
     synth.generate(tmp_path, effect=1.0, seed=0)
-    
+    # Restamp every file as a cifar block at max_len 1024, and set linformer n_params to
+    # the CORRECT cifar overhead so the check should pass, not fire.
     for path in list(Path(tmp_path).glob("d[0-9]*.json")):
         payload = json.loads(path.read_text())
         payload["task"] = "cifar"
         payload["config"]["task"] = "cifar"
         payload["config"]["max_len"] = 1024
         payload["config"]["linformer_k"] = 256
-        
         if payload["variant"] == "linformer":
-            base = payload["n_params"] - 512_000
-            payload["n_params"] = base + 256 * 1024
-            
+            # base non-linformer count in the synth generator is design-dependent; recompute
+            base = payload["n_params"] - 512_000      # strip the listops overhead the synth added
+            payload["n_params"] = base + 256 * 1024    # apply the correct cifar overhead
         (Path(tmp_path) / f"cifar_{path.name}").write_text(json.dumps(payload))
         path.unlink()
 
     df, report = collect.load_results(tmp_path, phase="full")
     overhead_failures = [f for f in report.integrity_failures if "overhead" in f]
-    
     assert not overhead_failures, f"task-aware overhead check false-fired: {overhead_failures}"
 
 
 def test_linformer_wrong_overhead_still_caught_per_task(tmp_path):
-    """Verifies that a genuinely incorrect task-specific parameter overhead is still flagged."""
+    """A genuinely wrong overhead is still flagged, with the task's expected value."""
     synth.generate(tmp_path, effect=1.0, seed=0)
-    
     for path in list(Path(tmp_path).glob("d[0-9]*.json")):
         payload = json.loads(path.read_text())
         payload["task"] = "cifar"
         payload["config"]["task"] = "cifar"
         payload["config"]["max_len"] = 1024
         payload["config"]["linformer_k"] = 256
-        
         if payload["variant"] == "linformer":
-            payload["n_params"] += 99
-            
+            payload["n_params"] += 99          # break it
         (Path(tmp_path) / f"cifar_{path.name}").write_text(json.dumps(payload))
         path.unlink()
 
     df, report = collect.load_results(tmp_path, phase="full")
-    
     assert any("262,144" in f for f in report.integrity_failures)
+
+
+def retask(src_dir, task, max_len, out_dir=None):
+    """Rewrite a synthetic grid as another task's results, named with that task's prefix.
+
+    The grid writes unprefixed `d000_flash_s0.json` for ListOps; real runs write
+    `<task>_d000_flash_s0.json`. This mirrors that naming so the collector is tested
+    against the filenames the cluster actually produces.
+    """
+    out_dir = Path(out_dir or src_dir)
+    for path in list(Path(src_dir).glob("d[0-9]*.json")):
+        payload = json.loads(path.read_text())
+        payload["task"] = task
+        payload["config"]["task"] = task
+        payload["config"]["max_len"] = max_len
+        if payload["variant"] == "linformer":
+            payload["n_params"] += payload["config"]["linformer_k"] * max_len - 512_000
+        (out_dir / f"{task}_{path.name}").write_text(json.dumps(payload))
+        path.unlink()
+
+
+def test_pathfinder_results_are_collected(tmp_path):
+    """A task whose results carry its own prefix must still be found.
+
+    This is a regression test. The collector used to look for one glob per task
+    ("listops_*", "cifar_*"), so when Pathfinder was added all 120 of its results were
+    invisible: the report said two tasks and no check fired, because a file that is never
+    opened cannot fail an integrity check. Recognition is now by payload, not filename.
+    """
+    synth.generate(tmp_path, effect=1.0, seed=0)
+    retask(tmp_path, "pathfinder", 1024)
+
+    df, report = collect.load_results(tmp_path, phase="full")
+    assert report.n_rows == 120
+    assert set(df["task"]) == {"pathfinder"}
+    assert sorted(report.complete_designs) == [("pathfinder", i) for i in range(8)]
+    assert not report.integrity_failures
+
+
+def test_an_unregistered_future_task_is_collected_too(tmp_path):
+    """Adding a fourth task must not require editing the collector.
+
+    The original bug was a list that had to be kept in lockstep with the task registry.
+    A task name the collector has never heard of proves that coupling is gone.
+    """
+    synth.generate(tmp_path, effect=1.0, seed=0)
+    retask(tmp_path, "text", 4000)
+
+    df, report = collect.load_results(tmp_path, phase="full")
+    assert report.n_rows == 120
+    assert set(df["task"]) == {"text"}
+
+
+def test_non_result_json_is_ignored_silently(tmp_path):
+    """Probe output shares this directory and must neither load nor warn.
+
+    Globbing every *.json is only safe if non-results are rejected on content. They are
+    also not errors, so they must not appear as warnings -- a report full of noise about
+    files it was never meant to read is a report nobody checks.
+    """
+    synth.generate(tmp_path, effect=1.0, seed=0)
+    (Path(tmp_path) / "memory_probe.json").write_text(
+        json.dumps({"peak_memory_mb": 1234, "variant": "vanilla", "batch_size": 32})
+    )
+    (Path(tmp_path) / "notes.json").write_text(json.dumps({"anything": "at all"}))
+
+    df, report = collect.load_results(tmp_path, phase="full")
+    assert report.n_files == 120
+    assert report.n_rows == 120
+    assert not report.warnings
+
+
+def test_two_tasks_side_by_side_are_both_collected(tmp_path):
+    """Both tasks' blocks appear, keyed on (task, design), with no cross-task merging."""
+    listops_dir = Path(tmp_path) / "listops_src"
+    synth.generate(listops_dir, effect=1.0, seed=0)
+    retask(listops_dir, "pathfinder", 1024, out_dir=tmp_path)
+    synth.generate(tmp_path, effect=1.0, seed=1)
+
+    df, report = collect.load_results(tmp_path, phase="full")
+    assert report.n_rows == 240
+    assert set(df["task"]) == {"listops", "pathfinder"}
+    assert len(report.complete_designs) == 16
