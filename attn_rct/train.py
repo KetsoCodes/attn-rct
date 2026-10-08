@@ -1,10 +1,10 @@
-"""Training entry point for a single (design, variant, seed) experimental cell.
+"""This is my training entry point for a single (design, variant, seed) experimental cell.
 
-Executes a single training run where the Slurm array index maps to a specific configuration 
-in the manifest. Includes periodic checkpointing and clean signal handling to survive 
-cluster preemption, ensuring RNG state is preserved for strict experimental pairing.
+It runs one training session based on the Slurm array index mapped to my manifest. 
+I included periodic checkpointing and clean signal handling so runs survive cluster 
+preemptions, which keeps the RNG state intact for strict experimental pairing.
 
-Writes a single JSON file containing averaged metrics.
+It finishes by writing a single JSON file with the averaged metrics.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ EXIT_REQUEUE = 42
 
 
 def handle_signal(signum, frame):
-    """Flags when a Slurm walltime warning or kill signal is received to trigger a clean exit."""
+    """Catches Slurm walltime warnings or kill signals so I can trigger a clean exit."""
     global INTERRUPTED
     print(f"\n[signal {signum}] walltime approaching -- checkpointing and exiting",
           flush=True)
@@ -38,7 +38,7 @@ def handle_signal(signum, frame):
 
 
 def parse_args():
-    """Parses command-line arguments and configuration overrides."""
+    """Parses command-line arguments and my configuration overrides."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--row", type=int, required=True)
@@ -60,13 +60,17 @@ def parse_args():
     parser.add_argument("--d-model", type=int, default=None)
     parser.add_argument("--depth", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None, help="override the manifest")
+    parser.add_argument("--compute-dtype", default=None,
+                        choices=["fp32", "bf16", "fp16", "auto"],
+                        help="override the manifest's attention compute precision; "
+                             "note the flash arm's kernels accept only fp16/bf16")
     parser.add_argument("--warmup-steps", type=int, default=None,
                         help="linear LR warmup over this many steps; 0 disables it")
     return parser.parse_args()
 
 
 def load_manifest_row(manifest: Path, row_index: int) -> SimpleNamespace:
-    """Reads a specific row from the manifest CSV and casts numerical fields appropriately."""
+    """Grabs a specific row from the manifest CSV and casts the numbers properly."""
     with open(manifest, newline="") as handle:
         rows = list(csv.DictReader(handle))
     if not 1 <= row_index <= len(rows):
@@ -87,13 +91,13 @@ def load_manifest_row(manifest: Path, row_index: int) -> SimpleNamespace:
 
 
 def resolve_config(args) -> SimpleNamespace:
-    """Combines the manifest row configuration with any command-line overrides."""
+    """Combines the manifest config with any command-line overrides I pass in."""
     cfg = load_manifest_row(Path(args.manifest), args.row)
     cfg.attention = cfg.variant
 
     if args.epochs is not None:
         cfg.epochs = args.epochs
-    for name in ("batch_size", "max_len", "d_model", "depth", "lr"):
+    for name in ("batch_size", "max_len", "d_model", "depth", "lr", "compute_dtype"):
         override = getattr(args, name)
         if override is not None:
             print(f"[override] {name}: {getattr(cfg, name, None)} -> {override}")
@@ -101,8 +105,7 @@ def resolve_config(args) -> SimpleNamespace:
     if args.d_model is not None:
         cfg.d_ff = 4 * cfg.d_model
 
-    # Warmup defaults to OFF so every run made before it existed is reproduced exactly.
-    # A manifest may carry warmup_steps per task; the flag overrides it.
+    # I leave warmup OFF by default so every run made before it existed is reproduced exactly.
     if args.warmup_steps is not None:
         print(f"[override] warmup_steps: "
               f"{getattr(cfg, 'warmup_steps', 0)} -> {args.warmup_steps}")
@@ -115,15 +118,15 @@ def resolve_config(args) -> SimpleNamespace:
 
 
 def apply_warmup(optimizer, base_lr: float, global_step: int, warmup_steps: int) -> float:
-    """Linearly ramp the learning rate from 0 to base_lr over the first warmup_steps.
+    """Linearly ramps the learning rate from 0 to base_lr over the first warmup_steps.
 
-    Transformers on some tasks -- Pathfinder in particular -- sit at chance for the whole
-    run without a warmup, because the first large updates land before attention has
-    organised and the model never recovers. A plain linear ramp is the LRA reference
-    recipe's mechanism and is the smallest change that tests that hypothesis.
+    Without a warmup, Transformers on tasks like Pathfinder just sit at chance forever.
+    The first massive updates hit before the attention mechanism has time to organize,
+    and the model never recovers. Adding a plain linear ramp (like the original LRA recipe)
+    is the smallest change I can make to test that hypothesis.
 
-    With warmup_steps == 0 the optimizer is left untouched, so runs made before warmup
-    existed are reproduced exactly.
+    If warmup_steps is 0, the optimizer is untouched, meaning my older runs stay perfectly 
+    reproducible.
 
     Args:
         optimizer: the optimizer whose param groups carry the learning rate.
@@ -144,12 +147,12 @@ def apply_warmup(optimizer, base_lr: float, global_step: int, warmup_steps: int)
 
 
 def serialisable_config(cfg) -> dict:
-    """Returns a JSON-safe dictionary of the configuration, filtering out private attributes."""
+    """Strips out private attributes so I can dump the config to JSON safely."""
     return {k: v for k, v in vars(cfg).items() if not k.startswith("_")}
 
 
 def evaluate(model, loader, device, limit_batches=None):
-    """Evaluates the model on the validation dataset."""
+    """Runs the model against the validation set."""
     model.eval()
     correct = total = 0
     loss_sum = 0.0
@@ -168,7 +171,7 @@ def evaluate(model, loader, device, limit_batches=None):
 
 
 def save_checkpoint(path, model, optimizer, epoch, best_accuracy):
-    """Writes a resumable checkpoint atomically via a temporary file."""
+    """Writes a resumable checkpoint atomically so I don't corrupt files if it crashes mid-write."""
     tmp = Path(str(path) + ".tmp")
     torch.save({
         "epoch": epoch,
@@ -183,7 +186,7 @@ def save_checkpoint(path, model, optimizer, epoch, best_accuracy):
 
 
 def resume(checkpoint_path, model, optimizer, device):
-    """Restores model weights, optimizer state, and RNG state if a checkpoint exists."""
+    """Loads the model weights, optimizer state, and RNG state if I have a checkpoint."""
     if not checkpoint_path.exists():
         return 0, 0.0
 
@@ -201,7 +204,7 @@ def resume(checkpoint_path, model, optimizer, device):
 
 
 def start_wandb(args, cfg, n_params, vocab_size):
-    """Initialises Weights & Biases logging if credentials are provided."""
+    """Fires up Weights & Biases logging if my API key is set."""
     enabled = (os.environ.get("WANDB_API_KEY")
                or os.environ.get("WANDB_MODE") == "offline")
     if not enabled:
@@ -228,7 +231,7 @@ def start_wandb(args, cfg, n_params, vocab_size):
 
 
 def write_json_atomic(path: Path, payload: dict):
-    """Writes a JSON payload atomically to prevent corrupted files on interruption."""
+    """Writes the final JSON payload atomically to prevent corrupted files on interruption."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(".json.tmp")
     with open(tmp_path, "w") as handle:
@@ -237,7 +240,7 @@ def write_json_atomic(path: Path, payload: dict):
 
 
 def build_result(cfg, args, history, n_params, backend, best_accuracy) -> dict:
-    """Assembles the final results payload for later analysis."""
+    """Pulls together the final results payload for my analysis script."""
     latest = history[-1] if history else {}
     return {
         "run_id": cfg.run_id,
@@ -254,9 +257,6 @@ def build_result(cfg, args, history, n_params, backend, best_accuracy) -> dict:
         "mean_train_seconds_per_epoch":
             sum(e["train_seconds"] for e in history) / len(history) if history else None,
         "peak_memory_mb": max((e.get("peak_memory_mb", 0) for e in history), default=None),
-        # Steps whose gradient norm was non-finite and were therefore scaled to a zero
-        # update by clipping. Anything above 0 means part of this run did not train, and
-        # the analysis should treat the cell as suspect rather than as a measurement.
         "nonfinite_grad_steps": latest.get("nonfinite_grad_steps", 0),
         "history": history,
     }
@@ -272,8 +272,6 @@ def main():
     print(f"=== {cfg.run_id} | variant={cfg.variant} | seed={cfg.seed} | {device} ===")
     print(f"config: {vars(cfg)}")
 
-    # The manifest carries a per-task data_dir; a --data-dir on the command line, if
-    # given, overrides it (useful for smoke tests pointing at a small local copy).
     data_dir = args.data_dir or getattr(cfg, "data_dir", None)
     if data_dir is None:
         raise SystemExit(
@@ -317,12 +315,13 @@ def main():
 
     last_checkpoint = time.time()
     history = []
-    # Counted across the whole session, not per epoch: a run that silently stopped learning
-    # should report one number the analysis can screen on.
+    
+    # I count this across the whole session, not per epoch. If a run silently stops learning,
+    # I want one single number my analysis script can screen for.
     nonfinite_grad_steps = 0
     
-    # Warmup is driven by the global step so a resumed run continues the ramp from where
-    # it left off rather than restarting it, which would re-apply small updates.
+    # Warmup is tied to the global step. If I resume a run, it continues the ramp from where
+    # it left off instead of restarting it (which would just re-apply tiny updates).
     base_lr = float(cfg.lr)
     warmup_steps = int(getattr(cfg, "warmup_steps", 0) or 0)
     batches_per_epoch = len(train_loader)
@@ -347,17 +346,16 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             loss = criterion(model(tokens, mask), targets)
             loss.backward()
-            # Clipping is left exactly as it was, so every result produced before this
-            # counter existed is still reproducible bit-for-bit. The RETURN VALUE is what
-            # is new, and it is only counted.
+            
+            # I left the clipping math exactly as it was, so every result I ran before adding 
+            # this counter is perfectly reproducible. I'm just looking at the return value now.
             #
-            # Why it is counted: clip_grad_norm_ scales gradients by max_norm/total_norm,
-            # so a non-finite total_norm gives a coefficient of 1/inf = 0 and the optimiser
-            # applies an update of exactly nothing. The loss then stops moving while
-            # training reports success -- no exception, no NaN loss, just a frozen model.
-            # That is what happened to both lr 1e-2 Pathfinder probe cells, and it was only
-            # detectable because their validation loss was bit-identical across epochs.
-            # Silence is the defect here, so the count travels with the result.
+            # Here's why I'm counting it: `clip_grad_norm_` scales gradients by max_norm/total_norm.
+            # If the total_norm is infinite, the coefficient becomes 1/inf = 0, meaning the optimizer 
+            # applies an update of exactly zero. The loss freezes, but training happily reports 
+            # success instead of throwing a NaN or crashing. That's exactly what trapped my 1e-2 
+            # Pathfinder runs. Since PyTorch is silently failing here, I need to count these 
+            # non-finite steps and track them with the results.
             total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             if not torch.isfinite(total_norm):
                 nonfinite_grad_steps += 1
