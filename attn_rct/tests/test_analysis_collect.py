@@ -357,3 +357,66 @@ def test_missing_counter_is_unknown_not_zero(full_grid):
     _df, report = collect.load_results(full_grid, phase="full")
     assert any("predate the non-finite-gradient counter" in w for w in report.warnings)
     assert not report.integrity_failures
+
+
+def test_a_block_with_no_results_is_reported_as_absent(full_grid):
+    """A block with zero result files must be named, not silently omitted.
+
+    This is a regression test. Completeness used to be checked by iterating over the
+    blocks PRESENT in the table, so a block with no files never entered the table and
+    nothing checked it. On the real grid that hid pathfinder/d006 and d007 entirely: the
+    report said 18 complete and 4 incomplete and mentioned nothing else, and only the row
+    count gave it away. A check that cannot fire on missing data is not a check.
+    """
+    for path in Path(full_grid).glob("d006_*.json"):
+        path.unlink()
+
+    _df, report = collect.load_results(full_grid, phase="full")
+    assert ("listops", 6) in report.absent_blocks
+    assert ("listops", 6) not in report.incomplete_designs
+    assert "ABSENT blocks" in report.summary()
+    assert "listops/d006" in report.summary()
+
+
+def test_absent_and_incomplete_are_distinguished(full_grid):
+    """Partly missing and entirely missing are different problems and are reported apart."""
+    for path in Path(full_grid).glob("d006_*.json"):
+        path.unlink()
+    (Path(full_grid) / "d003_sparse_s1.json").unlink()
+
+    _df, report = collect.load_results(full_grid, phase="full")
+    assert report.absent_blocks == [("listops", 6)]
+    assert list(report.incomplete_designs) == [("listops", 3)]
+
+
+def test_absent_blocks_are_fatal_when_not_dropping(full_grid):
+    """drop_incomplete=False must refuse an absent block as readily as a partial one."""
+    for path in Path(full_grid).glob("d006_*.json"):
+        path.unlink()
+
+    df, report = collect.load_results(full_grid, phase="full")
+    with pytest.raises(ValueError, match="no results at all"):
+        collect.require_complete(df, report, drop_incomplete=False)
+
+
+def test_absence_is_checked_per_task(full_grid, tmp_path):
+    """Each task is expected to carry the whole design space, independently.
+
+    A second task missing a block must be flagged even when the first task is complete,
+    which is what makes the check useful as tasks are added.
+    """
+    retask(full_grid, "pathfinder", 1024, out_dir=tmp_path)
+    for path in Path(tmp_path).glob("pathfinder_d007_*.json"):
+        path.unlink()
+    synth.generate(tmp_path, effect=1.0, seed=1)
+
+    _df, report = collect.load_results(tmp_path, phase="full")
+    assert ("pathfinder", 7) in report.absent_blocks
+    assert not any(task == "listops" for task, _ in report.absent_blocks)
+
+
+def test_complete_grid_has_no_absent_blocks(full_grid):
+    """The healthy case must stay silent, or the field becomes noise."""
+    _df, report = collect.load_results(full_grid, phase="full")
+    assert report.absent_blocks == []
+    assert "ABSENT" not in report.summary()

@@ -40,6 +40,10 @@ class CollectionReport:
     n_rows: int = 0
     complete_designs: list = field(default_factory=list)
     incomplete_designs: dict = field(default_factory=dict)   # design_id -> missing cells
+    # Blocks with NO rows at all. These cannot appear in incomplete_designs, because a
+    # block with zero rows is not in the table to be checked -- which is exactly why they
+    # need their own field. See _check_completeness.
+    absent_blocks: list = field(default_factory=list)
     integrity_failures: list = field(default_factory=list)   # human-readable strings
     warnings: list = field(default_factory=list)
 
@@ -54,6 +58,15 @@ class CollectionReport:
             lines.append(f"incomplete blocks    : {len(self.incomplete_designs)}")
             for (task, design_id), missing in sorted(self.incomplete_designs.items()):
                 lines.append(f"    {task}/d{design_id:03d} missing: {missing}")
+        if self.absent_blocks:
+            lines.append(
+                f"ABSENT blocks        : {len(self.absent_blocks)} "
+                f"{[f'{t}/d{d:03d}' for t, d in sorted(self.absent_blocks)]}"
+            )
+            lines.append(
+                "    these have no results at all, so no completeness or integrity "
+                "check could run on them"
+            )
         if self.integrity_failures:
             lines.append("integrity failures   :")
             lines.extend(f"    {f}" for f in self.integrity_failures)
@@ -173,8 +186,33 @@ def _blocks(df):
         yield r["task"], int(r["design_id"])
 
 
+def _expected_blocks(df):
+    """Every (task, design) block the design space implies for the tasks observed.
+
+    A task with no results at all cannot be inferred from the results, so this bounds the
+    claim to the tasks that appear. Within a task, all N_DESIGNS blocks are expected.
+    """
+    for task in sorted(df["task"].unique()):
+        for design_id in range(N_DESIGNS):
+            yield task, design_id
+
+
 def _check_completeness(df, report):
-    """Record which (task, design) blocks have all 5 variants x 3 seeds."""
+    """Record which (task, design) blocks have all 5 variants x 3 seeds.
+
+    The expected block set is the cross-product of the tasks observed with the design
+    space, NOT the blocks that happen to be present. Iterating over what is present was
+    the earlier behaviour and it hid two whole blocks: pathfinder/d006 and d007 had zero
+    result files, so they never entered the table, so nothing checked them, so the report
+    listed 18 complete and 4 incomplete blocks and said nothing about the missing 2. The
+    row count was the only clue. That is the same failure mode as the per-task filename
+    glob -- a check that cannot fire on absent data is not a check -- so absence is now
+    derived rather than observed.
+    """
+    for task, design_id in _expected_blocks(df):
+        if not ((df["task"] == task) & (df["design_id"] == design_id)).any():
+            report.absent_blocks.append((task, design_id))
+
     expected = {(v, s) for v in VARIANTS for s in SEEDS}
     for task, design_id in _blocks(df):
         block = df[(df["task"] == task) & (df["design_id"] == design_id)]
@@ -330,12 +368,14 @@ def require_complete(df, report, drop_incomplete=True):
         )
     if df.empty or "design_id" not in df.columns:
         raise ValueError("no results to analyse (empty result set)")
-    if report.incomplete_designs and not drop_incomplete:
+    if (report.incomplete_designs or report.absent_blocks) and not drop_incomplete:
+        detail = [f"{task}/d{design_id:03d}: {m}"
+                  for (task, design_id), m in sorted(report.incomplete_designs.items())]
+        detail += [f"{task}/d{design_id:03d}: no results at all"
+                   for task, design_id in sorted(report.absent_blocks)]
         raise ValueError(
             "incomplete blocks present and drop_incomplete=False:\n  "
-            + "\n  ".join(f"{task}/d{design_id:03d}: {m}"
-                          for (task, design_id), m
-                          in sorted(report.incomplete_designs.items()))
+            + "\n  ".join(detail)
         )
     complete = set(report.complete_designs)
     mask = df.apply(lambda r: (r["task"], int(r["design_id"])) in complete, axis=1)
