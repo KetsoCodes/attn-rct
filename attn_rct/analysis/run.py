@@ -1,9 +1,16 @@
-"""Executes the Demsar analysis pipeline.
+"""Run the whole Demsar pipeline and write the report.
 
-Transforms result JSONs into a complete report (CD diagrams, cross-task plots, 
-and summary tables). Refuses to analyze incomplete or broken data matrices.
+This is the one command that turns a directory of result files into the artifacts a
+write-up needs: for every metric, at every scope (pooled and each task), it collects,
+checks, aggregates, runs the omnibus, the post-hoc against the baseline, and the effect
+sizes, then writes a critical-difference diagram, a results table, and a machine-readable
+summary. Per-metric cross-task figures show whether the ranking moves between tasks.
 
-Usage:
+Nothing is recomputed anywhere but in the analysis stages, so every number in every
+figure traces back to the same table. The run refuses rather than guesses: an incomplete
+matrix or a failed integrity check stops it, because a partial or broken matrix silently
+analysed is the failure mode the whole design exists to prevent.
+
     python -m attn_rct.analysis.run --results-dir results --out report
     python -m attn_rct.analysis.run --results-dir results --baseline flash --alpha 0.05
 """
@@ -22,44 +29,36 @@ METRICS = ["best_val_accuracy", "mean_train_seconds_per_epoch", "peak_memory_mb"
 
 
 def analyse_scope(cells, metric, baseline, alpha, method, n_permutations, n_bootstrap):
-    """Runs the statistical pipeline (omnibus, effects, post-hoc) for one metric."""
+    """Run omnibus, post-hoc and effects for one metric on one set of cells.
+
+    Returns:
+        Dict of the three results, or None if the omnibus does not reject (in which case
+        post-hoc is deliberately not run, per the plan).
+    """
     direction = aggregate.METRIC_DIRECTION[metric]
     ranked = aggregate.rank_within_blocks(cells, metric)
     rank_matrix = aggregate.rank_matrix(ranked)
     mean_ranks = aggregate.mean_ranks(ranked)
 
-    om = omnibus.run_omnibus(
-        rank_matrix, metric, alpha=alpha, n_permutations=n_permutations
-    )
+    om = omnibus.run_omnibus(rank_matrix, metric, alpha=alpha,
+                             n_permutations=n_permutations)
 
     result = {"omnibus": om, "mean_ranks": mean_ranks, "posthoc": None, "effects": None}
-    
-    # Always compute effects; non-rejection is not definitive equivalence.
+    # Effect sizes are reported regardless of the omnibus, because a non-rejection at
+    # this N is not evidence of equivalence. Post-hoc is only run on a rejection.
     result["effects"] = effects.compute_effects(
-        aggregate.value_matrix(cells, metric), 
-        baseline, 
-        metric, 
-        direction,
-        n_bootstrap=n_bootstrap, 
-        alpha=alpha,
+        aggregate.value_matrix(cells, metric), baseline, metric, direction,
+        n_bootstrap=n_bootstrap, alpha=alpha,
     )
-    
-    # Post-hoc requires omnibus rejection.
     if om.reject:
         result["posthoc"] = posthoc.compare_to_control(
-            mean_ranks, 
-            baseline, 
-            len(rank_matrix), 
-            metric, 
-            method=method, 
-            alpha=alpha,
+            mean_ranks, baseline, len(rank_matrix), metric, method=method, alpha=alpha,
         )
-        
     return result
 
 
 def _scope_summary(metric, res) -> dict:
-    """Formats a metric's analysis results for JSON serialization."""
+    """A JSON-safe summary of one metric's analysis at one scope."""
     om = res["omnibus"]
     summary = {
         "metric": metric,
@@ -70,10 +69,8 @@ def _scope_summary(metric, res) -> dict:
         "permutation_p": om.permutation_p,
         "reject": om.reject,
     }
-    
     if res["posthoc"] is not None:
         summary["significant_vs_baseline"] = list(res["posthoc"].significant()["variant"])
-        
     if res["effects"] is not None:
         summary["effects"] = {
             r["variant"]: {
@@ -84,7 +81,6 @@ def _scope_summary(metric, res) -> dict:
             }
             for _, r in res["effects"].table.iterrows()
         }
-        
     return summary
 
 
@@ -104,13 +100,11 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load and rigidly validate matrix integrity.
     df, report = collect.load_results(args.results_dir, phase=args.phase)
     print(report.summary())
     print("=" * 72)
-    keep = collect.require_complete(df, report)
+    keep = collect.require_complete(df, report)      # raises on a broken/empty matrix
 
-    # 2. Aggregate seeds and define scopes.
     cells = aggregate.aggregate_seeds(keep)
     tasks = sorted(cells["task"].unique())
     scopes = {"pooled": cells}
@@ -128,21 +122,38 @@ def main():
         "scopes": {},
     }
 
-    # Track ranks for cross-task comparison figures.
+    # Per-metric, collect each scope's mean ranks for the cross-task figure.
     per_task_ranks = {m: {} for m in METRICS}
 
-    # 3. Execute analysis pipeline per scope and metric.
     for scope, scope_cells in scopes.items():
         summary["scopes"][scope] = {}
-        
         for metric in METRICS:
-            res = analyse_scope(
-                scope_cells, metric, args.baseline, args.alpha,
-                args.method, args.permutations, args.bootstrap
-            )
-            summary["scopes"][scope][metric] = _scope_summary(metric, res)
+            # Rule A of analysis_plan_amendment_01: a block where no arm beat chance
+            # contributes the rank vector (3,3,3,3,3), which adds nothing to the Friedman
+            # numerator while still raising the block count, and so lowers power on the
+            # blocks that do carry an effect. Accuracy only -- efficiency is measured
+            # whether or not the model learned. The exclusion is always reported, because
+            # an unstated exclusion is indistinguishable from data that never existed.
+            metric_cells, dropped = aggregate.drop_degenerate_blocks(scope_cells, metric)
+            if dropped:
+                print(f"[{scope}/{metric}] excluded {len(dropped)} degenerate block(s) "
+                      f"(no arm above chance + {aggregate.DEGENERATE_MARGIN}): "
+                      + ", ".join(f"{t}/d{d:03d}" for t, d in dropped))
+            if metric_cells.empty:
+                print(f"[{scope}/{metric}] every block was degenerate; metric skipped")
+                summary["scopes"][scope][metric] = {
+                    "skipped": "all blocks degenerate",
+                    "degenerate_blocks": [[t, int(d)] for t, d in dropped],
+                }
+                continue
 
-            # Generate artifacts if post-hoc tests ran.
+            res = analyse_scope(metric_cells, metric, args.baseline, args.alpha,
+                                args.method, args.permutations, args.bootstrap)
+            summary["scopes"][scope][metric] = _scope_summary(metric, res)
+            summary["scopes"][scope][metric]["degenerate_blocks"] = [
+                [t, int(d)] for t, d in dropped
+            ]
+
             if res["posthoc"] is not None:
                 fig = out / f"cd_{scope}_{metric}.{args.figure_format}"
                 plots.critical_difference_diagram(
@@ -155,7 +166,7 @@ def main():
             if scope in tasks:
                 per_task_ranks[metric][scope] = res["mean_ranks"]
 
-    # 4. Generate cross-task figures.
+    # Cross-task figures: one per metric, showing whether the ranking moves.
     if len(tasks) > 1:
         for metric in METRICS:
             if len(per_task_ranks[metric]) > 1:
@@ -165,7 +176,6 @@ def main():
                     out / f"crosstask_{metric}.{args.figure_format}",
                 )
 
-    # 5. Output summary JSON and console digest.
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"\nwrote report to {out}/")
     print(f"  {len(list(out.glob('cd_*')))} critical-difference diagrams")
@@ -173,9 +183,9 @@ def main():
     print(f"  {len(list(out.glob('table_*.csv')))} results tables")
     print(f"  summary.json")
 
-    print(f"\nheadline (arms significantly better/worse than {args.baseline}, "
-          f"{args.method}-corrected):")
-          
+    # A short console digest of the headline: which arms beat the baseline where.
+    print("\nheadline (arms significantly better/worse than "
+          f"{args.baseline}, {args.method}-corrected):")
     for scope in scopes:
         for metric in METRICS:
             s = summary["scopes"][scope][metric]

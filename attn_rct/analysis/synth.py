@@ -136,6 +136,10 @@ def make_result(design_id, design, variant, seed, effect, rng):
         "best_val_accuracy": best_acc,
         "final_val_accuracy": final_acc,
         "epochs_trained_this_session": 20,
+        # Mirrors train.py: a healthy run reports zero steps whose gradient norm was
+        # non-finite. Synthetic results stand in for real ones, so they must carry the
+        # same schema or the collector's checks go untested against the current format.
+        "nonfinite_grad_steps": 0,
         "mean_train_seconds_per_epoch":
             sum(e["train_seconds"] for e in history) / len(history),
         "peak_memory_mb": max(e["peak_memory_mb"] for e in history),

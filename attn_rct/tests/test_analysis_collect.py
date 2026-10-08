@@ -319,3 +319,41 @@ def test_two_tasks_side_by_side_are_both_collected(tmp_path):
     assert report.n_rows == 240
     assert set(df["task"]) == {"listops", "pathfinder"}
     assert len(report.complete_designs) == 16
+
+
+def test_nonfinite_gradient_steps_are_an_integrity_failure(full_grid):
+    """A cell whose updates were zeroed by clipping is not a measurement.
+
+    This is the Pathfinder lr 1e-2 failure mode: clip_grad_norm_ scales by
+    max_norm/total_norm, so a non-finite norm gives a coefficient of 1/inf = 0 and the
+    optimiser applies nothing. No exception, no NaN loss -- just a model that stops
+    learning while the run reports success.
+    """
+    corrupt(full_grid, "d002_linear_s1", lambda p: p.update(nonfinite_grad_steps=417))
+    _df, report = collect.load_results(full_grid, phase="full")
+    assert any("non-finite gradient" in f for f in report.integrity_failures)
+    assert any("417" in f for f in report.integrity_failures)
+
+
+def test_zero_nonfinite_steps_is_clean(full_grid):
+    """The healthy case must not fire, or the check becomes noise nobody reads."""
+    _df, report = collect.load_results(full_grid, phase="full")
+    assert not report.integrity_failures
+    assert not any("non-finite" in w for w in report.warnings)
+
+
+def test_missing_counter_is_unknown_not_zero(full_grid):
+    """Runs predating the counter must be reported as unknown, not assumed healthy.
+
+    The ListOps and CIFAR results were produced before the counter existed, so whether any
+    of their steps were zeroed cannot be established after the fact. Recording that as a
+    warning is honest; defaulting it to 0 would be a claim the data does not support.
+    """
+    for path in Path(full_grid).glob("d[0-9]*.json"):
+        payload = json.loads(path.read_text())
+        payload.pop("nonfinite_grad_steps", None)
+        path.write_text(json.dumps(payload))
+
+    _df, report = collect.load_results(full_grid, phase="full")
+    assert any("predate the non-finite-gradient counter" in w for w in report.warnings)
+    assert not report.integrity_failures

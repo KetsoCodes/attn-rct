@@ -1,11 +1,10 @@
 """Training entry point for a single (design, variant, seed) experimental cell.
 
-Executes a single training run where the Slurm array index maps to a specific 
-configuration in the manifest. Includes periodic checkpointing and clean signal 
-handling to survive cluster preemption, ensuring RNG state is preserved for 
-strict experimental pairing.
+Executes a single training run where the Slurm array index maps to a specific configuration 
+in the manifest. Includes periodic checkpointing and clean signal handling to survive 
+cluster preemption, ensuring RNG state is preserved for strict experimental pairing.
 
-Writes a single JSON file containing averaged metrics upon completion.
+Writes a single JSON file containing averaged metrics.
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ EXIT_REQUEUE = 42
 
 
 def handle_signal(signum, frame):
-    """Flags when a Slurm walltime warning or kill signal is received for a clean exit."""
+    """Flags when a Slurm walltime warning or kill signal is received to trigger a clean exit."""
     global INTERRUPTED
     print(f"\n[signal {signum}] walltime approaching -- checkpointing and exiting",
           flush=True)
@@ -44,15 +43,15 @@ def parse_args():
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--row", type=int, required=True)
     parser.add_argument("--data-dir", default=None,
-                        help="Overrides the manifest's per-task data_dir if given")
+                        help="overrides the manifest's per-task data_dir if given")
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--result-file", required=True)
     parser.add_argument("--checkpoint-every-min", type=float, default=30.0)
     parser.add_argument("--require-flash", action="store_true",
-                        help="Fail loudly if the true FA-2 path is unreachable")
-    parser.add_argument("--epochs", type=int, default=None, help="Override the manifest")
+                        help="fail loudly if the true FA-2 path is unreachable")
+    parser.add_argument("--epochs", type=int, default=None, help="override the manifest")
     parser.add_argument("--limit-batches", type=int, default=None,
-                        help="Smoke-test only: cap batches per epoch")
+                        help="smoke-test only: cap batches per epoch")
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--phase", default="pilot", choices=["smoke", "pilot", "full"],
                         help="Categorises runs to separate throwaway tests from reportable data")
@@ -60,9 +59,9 @@ def parse_args():
     parser.add_argument("--max-len", type=int, default=None)
     parser.add_argument("--d-model", type=int, default=None)
     parser.add_argument("--depth", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=None, help="Override the manifest")
+    parser.add_argument("--lr", type=float, default=None, help="override the manifest")
     parser.add_argument("--warmup-steps", type=int, default=None,
-                        help="Linear LR warmup over this many steps; 0 disables it")
+                        help="linear LR warmup over this many steps; 0 disables it")
     return parser.parse_args()
 
 
@@ -70,7 +69,6 @@ def load_manifest_row(manifest: Path, row_index: int) -> SimpleNamespace:
     """Reads a specific row from the manifest CSV and casts numerical fields appropriately."""
     with open(manifest, newline="") as handle:
         rows = list(csv.DictReader(handle))
-        
     if not 1 <= row_index <= len(rows):
         raise IndexError(f"row {row_index} out of range; manifest has {len(rows)} rows")
 
@@ -85,7 +83,6 @@ def load_manifest_row(manifest: Path, row_index: int) -> SimpleNamespace:
                 continue
         else:
             typed[key] = value
-            
     return SimpleNamespace(**typed)
 
 
@@ -96,13 +93,11 @@ def resolve_config(args) -> SimpleNamespace:
 
     if args.epochs is not None:
         cfg.epochs = args.epochs
-        
     for name in ("batch_size", "max_len", "d_model", "depth", "lr"):
         override = getattr(args, name)
         if override is not None:
             print(f"[override] {name}: {getattr(cfg, name, None)} -> {override}")
             setattr(cfg, name, override)
-            
     if args.d_model is not None:
         cfg.d_ff = 4 * cfg.d_model
 
@@ -120,37 +115,36 @@ def resolve_config(args) -> SimpleNamespace:
 
 
 def apply_warmup(optimizer, base_lr: float, global_step: int, warmup_steps: int) -> float:
-    """Linearly ramps the learning rate from 0 to base_lr over the first warmup_steps.
+    """Linearly ramp the learning rate from 0 to base_lr over the first warmup_steps.
 
-    Transformers on some tasks (like Pathfinder) sit at chance for the whole run 
-    without a warmup, because the first large updates land before attention has 
-    organised. A plain linear ramp is the LRA reference recipe's mechanism.
+    Transformers on some tasks -- Pathfinder in particular -- sit at chance for the whole
+    run without a warmup, because the first large updates land before attention has
+    organised and the model never recovers. A plain linear ramp is the LRA reference
+    recipe's mechanism and is the smallest change that tests that hypothesis.
 
-    With warmup_steps == 0, the optimizer is left untouched, reproducing older runs exactly.
+    With warmup_steps == 0 the optimizer is left untouched, so runs made before warmup
+    existed are reproduced exactly.
 
     Args:
-        optimizer: The optimizer whose param groups carry the learning rate.
-        base_lr: The configured learning rate target.
-        global_step: Steps completed since the start of training (not just this session).
-        warmup_steps: Length of the ramp; 0 disables it.
+        optimizer: the optimizer whose param groups carry the learning rate.
+        base_lr: the configured learning rate, the value warmup ramps up to.
+        global_step: steps completed since the start of training, not of this session.
+        warmup_steps: length of the ramp; 0 disables it.
 
     Returns:
-        The learning rate currently in effect, for logging purposes.
+        The learning rate now in effect, for logging.
     """
     if not warmup_steps:
         return base_lr
-        
     scale = min(1.0, (global_step + 1) / float(warmup_steps))
     lr = base_lr * scale
-    
     for group in optimizer.param_groups:
         group["lr"] = lr
-        
     return lr
 
 
 def serialisable_config(cfg) -> dict:
-    """Returns a JSON-safe dictionary of the configuration, omitting private attributes."""
+    """Returns a JSON-safe dictionary of the configuration, filtering out private attributes."""
     return {k: v for k, v in vars(cfg).items() if not k.startswith("_")}
 
 
@@ -160,7 +154,6 @@ def evaluate(model, loader, device, limit_batches=None):
     correct = total = 0
     loss_sum = 0.0
     criterion = nn.CrossEntropyLoss()
-    
     with torch.no_grad():
         for i, (tokens, mask, targets) in enumerate(loader):
             if limit_batches and i >= limit_batches:
@@ -170,7 +163,6 @@ def evaluate(model, loader, device, limit_batches=None):
             loss_sum += criterion(logits, targets).item() * targets.size(0)
             correct += (logits.argmax(dim=-1) == targets).sum().item()
             total += targets.size(0)
-            
     model.train()
     return correct / max(total, 1), loss_sum / max(total, 1)
 
@@ -191,14 +183,13 @@ def save_checkpoint(path, model, optimizer, epoch, best_accuracy):
 
 
 def resume(checkpoint_path, model, optimizer, device):
-    """Restores model weights, optimizer, and RNG state if a checkpoint exists."""
+    """Restores model weights, optimizer state, and RNG state if a checkpoint exists."""
     if not checkpoint_path.exists():
         return 0, 0.0
 
     state = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(state["model"])
     optimizer.load_state_dict(state["optimizer"])
-    
     torch.set_rng_state(state["cpu_rng"].cpu())
     if state["cuda_rng"] is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda_rng"]])
@@ -206,13 +197,13 @@ def resume(checkpoint_path, model, optimizer, device):
     start_epoch = state["epoch"] + 1
     best_accuracy = state["best_accuracy"]
     print(f"[resume] from epoch {start_epoch}, best acc {best_accuracy:.4f}")
-    
     return start_epoch, best_accuracy
 
 
 def start_wandb(args, cfg, n_params, vocab_size):
     """Initialises Weights & Biases logging if credentials are provided."""
-    enabled = (os.environ.get("WANDB_API_KEY") or os.environ.get("WANDB_MODE") == "offline")
+    enabled = (os.environ.get("WANDB_API_KEY")
+               or os.environ.get("WANDB_MODE") == "offline")
     if not enabled:
         return None
 
@@ -263,6 +254,10 @@ def build_result(cfg, args, history, n_params, backend, best_accuracy) -> dict:
         "mean_train_seconds_per_epoch":
             sum(e["train_seconds"] for e in history) / len(history) if history else None,
         "peak_memory_mb": max((e.get("peak_memory_mb", 0) for e in history), default=None),
+        # Steps whose gradient norm was non-finite and were therefore scaled to a zero
+        # update by clipping. Anything above 0 means part of this run did not train, and
+        # the analysis should treat the cell as suspect rather than as a measurement.
+        "nonfinite_grad_steps": latest.get("nonfinite_grad_steps", 0),
         "history": history,
     }
 
@@ -274,21 +269,19 @@ def main():
 
     cfg = resolve_config(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
     print(f"=== {cfg.run_id} | variant={cfg.variant} | seed={cfg.seed} | {device} ===")
     print(f"config: {vars(cfg)}")
 
-    # Command line --data-dir overrides manifest data_dir (useful for smoke tests).
+    # The manifest carries a per-task data_dir; a --data-dir on the command line, if
+    # given, overrides it (useful for smoke tests pointing at a small local copy).
     data_dir = args.data_dir or getattr(cfg, "data_dir", None)
     if data_dir is None:
         raise SystemExit(
             "no data directory: pass --data-dir or include data_dir in the manifest"
         )
-        
     train_loader, val_loader, meta = build_dataloaders(
         cfg.task, data_dir, cfg.max_len, cfg.batch_size, cfg.seed, args.num_workers,
     )
-    
     print(f"task: {cfg.task} | vocab: {meta['vocab_size']} | "
           f"classes: {meta['n_classes']} | train batches: {len(train_loader)} "
           f"| val batches: {len(val_loader)}")
@@ -296,7 +289,6 @@ def main():
     torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.seed)
-        
     model = TransformerClassifier(
         cfg, vocab_size=meta["vocab_size"], n_classes=meta["n_classes"]
     ).to(device)
@@ -325,13 +317,16 @@ def main():
 
     last_checkpoint = time.time()
     history = []
+    # Counted across the whole session, not per epoch: a run that silently stopped learning
+    # should report one number the analysis can screen on.
+    nonfinite_grad_steps = 0
     
-    # Warmup is driven by global steps so a resumed run continues the ramp accurately.
+    # Warmup is driven by the global step so a resumed run continues the ramp from where
+    # it left off rather than restarting it, which would re-apply small updates.
     base_lr = float(cfg.lr)
     warmup_steps = int(getattr(cfg, "warmup_steps", 0) or 0)
     batches_per_epoch = len(train_loader)
     current_lr = base_lr
-    
     if warmup_steps:
         print(f"[warmup] linear ramp to lr={base_lr} over {warmup_steps} steps "
               f"({warmup_steps / max(batches_per_epoch, 1):.2f} epochs)")
@@ -344,17 +339,33 @@ def main():
         for i, (tokens, mask, targets) in enumerate(train_loader):
             if args.limit_batches and i >= args.limit_batches:
                 break
-                
             tokens, mask, targets = tokens.to(device), mask.to(device), targets.to(device)
 
             current_lr = apply_warmup(
                 optimizer, base_lr, epoch * batches_per_epoch + i, warmup_steps
             )
-            
             optimizer.zero_grad(set_to_none=True)
             loss = criterion(model(tokens, mask), targets)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # Clipping is left exactly as it was, so every result produced before this
+            # counter existed is still reproducible bit-for-bit. The RETURN VALUE is what
+            # is new, and it is only counted.
+            #
+            # Why it is counted: clip_grad_norm_ scales gradients by max_norm/total_norm,
+            # so a non-finite total_norm gives a coefficient of 1/inf = 0 and the optimiser
+            # applies an update of exactly nothing. The loss then stops moving while
+            # training reports success -- no exception, no NaN loss, just a frozen model.
+            # That is what happened to both lr 1e-2 Pathfinder probe cells, and it was only
+            # detectable because their validation loss was bit-identical across epochs.
+            # Silence is the defect here, so the count travels with the result.
+            total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if not torch.isfinite(total_norm):
+                nonfinite_grad_steps += 1
+                if nonfinite_grad_steps in (1, 10, 100, 1000):
+                    print(f"WARNING: non-finite gradient norm at epoch {epoch} step {i} "
+                          f"({nonfinite_grad_steps} so far). Clipping scales this update "
+                          f"to zero, so the model is not learning from these steps.",
+                          flush=True)
             optimizer.step()
 
             running_loss += loss.item() * targets.size(0)
@@ -383,11 +394,10 @@ def main():
             "val_accuracy": val_accuracy,
             "train_seconds": train_time,
             "lr": current_lr,
+            "nonfinite_grad_steps": nonfinite_grad_steps,
         }
-        
         if torch.cuda.is_available():
             record["peak_memory_mb"] = torch.cuda.max_memory_allocated() / 1e6
-            
         history.append(record)
         print(f"epoch {epoch}: {record}", flush=True)
         if run:
