@@ -39,7 +39,7 @@ def test_registry_lists_both_tasks():
 
 
 def test_unknown_task_is_refused(tmp_path):
-    with pytest.raises(KeyError, match="unknown task"):
+    with pytest.raises(KeyError, match="Unknown task"):
         data.build_dataloaders("mnist", tmp_path, 1024, 8, seed=0, num_workers=0)
 
 
@@ -100,7 +100,7 @@ def test_cifar_batch_shape_and_mask(tmp_path):
 def test_cifar_wrong_max_len_is_refused(tmp_path):
     """Fails if max_len doesn't match the fixed sequence length."""
     parent = write_cifar(tmp_path)
-    with pytest.raises(ValueError, match="fixed-length task"):
+    with pytest.raises(ValueError, match="requires max_len"):
         data.build_dataloaders("cifar", parent, 2000, 8, seed=0, num_workers=0)
 
 
@@ -188,7 +188,7 @@ def test_pathfinder_uses_own_train_dev_splits(tmp_path):
 
 def test_pathfinder_wrong_max_len_is_refused(tmp_path):
     write_pathfinder(tmp_path)
-    with pytest.raises(ValueError, match="fixed-length task"):
+    with pytest.raises(ValueError, match="requires max_len"):
         data.build_dataloaders("pathfinder", tmp_path, 2000, 8, seed=0, num_workers=0)
 
 
