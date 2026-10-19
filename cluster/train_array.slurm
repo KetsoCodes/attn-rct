@@ -5,11 +5,22 @@
 #SBATCH --error=/home-mscluster/fmnisi/attn_rct/logs/run_%A_%a.err
 #SBATCH --time=08:00:00
 #SBATCH --nodes=1
-#SBATCH --signal=B:USR1@300
+#SBATCH --signal=B:USR1@600
 
-# Submit using an array throttle (e.g., `sbatch --array=1-120%6 cluster/train_array.slurm`) 
-# to respect the cluster's concurrent job limit. 
-# A SIGUSR1 signal is requested 5 minutes before walltime to trigger a clean checkpoint.
+# Submit using an array throttle (e.g., `sbatch --array=1-120%6 cluster/train_array.slurm`)
+# to respect the cluster's concurrent job limit.
+#
+# Walltime handling. Ten minutes before the 8-hour limit Slurm sends SIGUSR1 to THIS batch
+# shell (the `B:` prefix). The shell then has to do three things, in order:
+#   1. forward the signal to training, which checkpoints at its next batch and exits;
+#   2. wait for that checkpoint to finish being written;
+#   3. requeue this array task, which resumes from the checkpoint when it restarts.
+# An earlier version requested the signal but never trapped it. Bash's default action for
+# SIGUSR1 is to terminate, so the batch shell died on the spot: the job ended FAILED with
+# exit 0:10, training never received the signal, and nothing requeued. Twelve Pathfinder
+# cells were lost this way at 7h55m; they survived only because of the 30-minute and
+# per-epoch checkpoints. The lead time is 10 minutes, not 5, so even a slow batch and the
+# checkpoint write fit inside it.
 
 set -euo pipefail
 
@@ -70,7 +81,25 @@ if [ "$gpu_ok" = "0" ]; then
 fi
 nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader
 
+TRAIN_PID=""
+
+on_walltime_warning() {
+    echo "=== walltime warning at $(date): checkpointing $RUN_ID and requeuing ==="
+    if [ -n "$TRAIN_PID" ]; then
+        # srun forwards SIGUSR1 to the training process, whose handler checkpoints at the
+        # next batch and exits with status 42 (EXIT_REQUEUE in train.py).
+        kill -USR1 "$TRAIN_PID" 2>/dev/null || true
+        wait "$TRAIN_PID" 2>/dev/null || true
+    fi
+    scontrol requeue "${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
+    echo "=== requeued ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} ==="
+    exit 0
+}
+trap on_walltime_warning USR1
+
 # Executes the training run. Data directories are dynamically sourced from the manifest.
+# Run in the background so the shell stays free to receive the walltime signal; a shell
+# blocked on a foreground command does not run its trap until that command returns.
 srun python -m attn_rct.train \
     --manifest "$MANIFEST" \
     --row "$SLURM_ARRAY_TASK_ID" \
@@ -79,6 +108,7 @@ srun python -m attn_rct.train \
     --checkpoint-every-min 30 \
     --phase full \
     --require-flash &
+TRAIN_PID=$!
 
-wait
+wait "$TRAIN_PID"
 echo "=== finished $RUN_ID: $(date) ==="
