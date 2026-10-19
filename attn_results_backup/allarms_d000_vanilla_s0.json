@@ -1,0 +1,48 @@
+{
+  "run_id": "d000_vanilla_s0",
+  "phase": "pilot",
+  "design_id": 0,
+  "variant": "vanilla",
+  "seed": 0,
+  "config": {
+    "run_id": "d000_vanilla_s0",
+    "design_id": 0,
+    "variant": "vanilla",
+    "seed": 0,
+    "batch_size": 8,
+    "d_model": 256,
+    "depth": 4,
+    "lr": 0.0003,
+    "d_ff": 1024,
+    "max_len": 2000,
+    "n_heads": 8,
+    "linformer_k": 256,
+    "linformer_sharing": "layerwise",
+    "attn_dropout": 0.0,
+    "dropout": 0.1,
+    "sparse_pattern": "fixed",
+    "sparse_stride": 45,
+    "compute_dtype": "bf16",
+    "epochs": 1,
+    "task": "listops",
+    "attention": "vanilla",
+    "require_flash": false
+  },
+  "n_params": 3678986,
+  "backend": null,
+  "best_val_accuracy": 0.18,
+  "final_val_accuracy": 0.18,
+  "epochs_trained_this_session": 1,
+  "mean_train_seconds_per_epoch": 10.518771171569824,
+  "peak_memory_mb": 3948.671488,
+  "history": [
+    {
+      "epoch": 0,
+      "train_loss": 2.396663281917572,
+      "val_loss": 2.3704559445381164,
+      "val_accuracy": 0.18,
+      "train_seconds": 10.518771171569824,
+      "peak_memory_mb": 3948.671488
+    }
+  ]
+}

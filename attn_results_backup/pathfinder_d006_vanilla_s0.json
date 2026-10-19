@@ -1,0 +1,73 @@
+{
+  "run_id": "pathfinder_d006_vanilla_s0",
+  "phase": "full",
+  "design_id": 6,
+  "variant": "vanilla",
+  "seed": 0,
+  "config": {
+    "run_id": "pathfinder_d006_vanilla_s0",
+    "task": "pathfinder",
+    "design_id": 6,
+    "variant": "vanilla",
+    "seed": 0,
+    "data_dir": "/datasets/fmnisi/pathfinder",
+    "max_len": 1024,
+    "batch_size": 16,
+    "d_model": 384,
+    "depth": 6,
+    "lr": 0.0003,
+    "d_ff": 1536,
+    "n_heads": 8,
+    "linformer_k": 256,
+    "linformer_sharing": "layerwise",
+    "attn_dropout": 0.0,
+    "dropout": 0.1,
+    "sparse_pattern": "fixed",
+    "sparse_stride": 45,
+    "compute_dtype": "bf16",
+    "epochs": 20,
+    "attention": "vanilla",
+    "warmup_steps": 0,
+    "require_flash": true
+  },
+  "n_params": 11139842,
+  "backend": null,
+  "best_val_accuracy": 0.50025,
+  "final_val_accuracy": 0.50015,
+  "epochs_trained_this_session": 3,
+  "mean_train_seconds_per_epoch": 1445.9657151699066,
+  "peak_memory_mb": 4312.610816,
+  "nonfinite_grad_steps": 0,
+  "history": [
+    {
+      "epoch": 17,
+      "train_loss": 0.6932046099245548,
+      "val_loss": 0.693257324886322,
+      "val_accuracy": 0.50015,
+      "train_seconds": 1447.6087963581085,
+      "lr": 0.0003,
+      "nonfinite_grad_steps": 0,
+      "peak_memory_mb": 4312.610816
+    },
+    {
+      "epoch": 18,
+      "train_loss": 0.6932073174118996,
+      "val_loss": 0.693280416059494,
+      "val_accuracy": 0.50015,
+      "train_seconds": 1444.3536121845245,
+      "lr": 0.0003,
+      "nonfinite_grad_steps": 0,
+      "peak_memory_mb": 4312.610816
+    },
+    {
+      "epoch": 19,
+      "train_loss": 0.6932079629361629,
+      "val_loss": 0.6931482246398926,
+      "val_accuracy": 0.50015,
+      "train_seconds": 1445.9347369670868,
+      "lr": 0.0003,
+      "nonfinite_grad_steps": 0,
+      "peak_memory_mb": 4312.610816
+    }
+  ]
+}

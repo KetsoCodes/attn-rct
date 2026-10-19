@@ -1,0 +1,93 @@
+{
+  "run_id": "pathfinder_d006_sparse_s2",
+  "phase": "full",
+  "design_id": 6,
+  "variant": "sparse",
+  "seed": 2,
+  "config": {
+    "run_id": "pathfinder_d006_sparse_s2",
+    "task": "pathfinder",
+    "design_id": 6,
+    "variant": "sparse",
+    "seed": 2,
+    "data_dir": "/datasets/fmnisi/pathfinder",
+    "max_len": 1024,
+    "batch_size": 16,
+    "d_model": 384,
+    "depth": 6,
+    "lr": 0.0003,
+    "d_ff": 1536,
+    "n_heads": 8,
+    "linformer_k": 256,
+    "linformer_sharing": "layerwise",
+    "attn_dropout": 0.0,
+    "dropout": 0.1,
+    "sparse_pattern": "fixed",
+    "sparse_stride": 45,
+    "compute_dtype": "bf16",
+    "epochs": 20,
+    "attention": "sparse",
+    "warmup_steps": 0,
+    "require_flash": true
+  },
+  "n_params": 11139842,
+  "backend": null,
+  "best_val_accuracy": 0.5027,
+  "final_val_accuracy": 0.50015,
+  "epochs_trained_this_session": 5,
+  "mean_train_seconds_per_epoch": 1712.2703750133514,
+  "peak_memory_mb": 4414.060544,
+  "nonfinite_grad_steps": 0,
+  "history": [
+    {
+      "epoch": 15,
+      "train_loss": 0.6932011765480042,
+      "val_loss": 0.6931679077625275,
+      "val_accuracy": 0.49985,
+      "train_seconds": 1712.0039343833923,
+      "lr": 0.0003,
+      "nonfinite_grad_steps": 0,
+      "peak_memory_mb": 4414.060544
+    },
+    {
+      "epoch": 16,
+      "train_loss": 0.6932128886163235,
+      "val_loss": 0.6931475995063782,
+      "val_accuracy": 0.49985,
+      "train_seconds": 1713.5136544704437,
+      "lr": 0.0003,
+      "nonfinite_grad_steps": 0,
+      "peak_memory_mb": 4414.060544
+    },
+    {
+      "epoch": 17,
+      "train_loss": 0.6932014616787434,
+      "val_loss": 0.693227300786972,
+      "val_accuracy": 0.50015,
+      "train_seconds": 1710.9695720672607,
+      "lr": 0.0003,
+      "nonfinite_grad_steps": 0,
+      "peak_memory_mb": 4414.060544
+    },
+    {
+      "epoch": 18,
+      "train_loss": 0.693177548879385,
+      "val_loss": 0.6931506451129913,
+      "val_accuracy": 0.49985,
+      "train_seconds": 1713.7167212963104,
+      "lr": 0.0003,
+      "nonfinite_grad_steps": 0,
+      "peak_memory_mb": 4414.060544
+    },
+    {
+      "epoch": 19,
+      "train_loss": 0.6932230520784854,
+      "val_loss": 0.6931806536197662,
+      "val_accuracy": 0.50015,
+      "train_seconds": 1711.14799284935,
+      "lr": 0.0003,
+      "nonfinite_grad_steps": 0,
+      "peak_memory_mb": 4414.060544
+    }
+  ]
+}
