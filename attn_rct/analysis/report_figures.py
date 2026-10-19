@@ -265,8 +265,36 @@ def paired_difference_figure(cells: pd.DataFrame, metric: str, path, xlabel: str
     return Path(path)
 
 
+def _spread(values, min_gap):
+    """Push sorted label positions apart so neighbours are at least `min_gap` apart.
+
+    Order is preserved and the group stays centred on the original positions, so a label
+    moves as little as it can while no longer overprinting its neighbour.
+
+    Returns:
+        Adjusted positions, in the same order as `values`.
+    """
+    values = np.asarray(values, dtype=float)
+    order = np.argsort(values)
+    placed = values[order].copy()
+    for _ in range(50):
+        moved = False
+        for i in range(1, len(placed)):
+            gap = placed[i] - placed[i - 1]
+            if gap < min_gap:
+                push = (min_gap - gap) / 2
+                placed[i - 1] -= push
+                placed[i] += push
+                moved = True
+        if not moved:
+            break
+    out = np.empty_like(placed)
+    out[order] = placed
+    return out
+
+
 def learning_curve_figure(history: pd.DataFrame, path, chance: dict | None = None,
-                          title: str | None = None):
+                          reference: dict | None = None, title: str | None = None):
     """Validation accuracy over training, per arm, with a 95% bootstrap band.
 
     Seeds are averaged within each (design, arm) first, then the band is a bootstrap over
@@ -275,15 +303,21 @@ def learning_curve_figure(history: pd.DataFrame, path, chance: dict | None = Non
 
     Args:
         history: long table with task, design_id, variant, seed, epoch, val_accuracy.
+        chance: {task: chance accuracy}, drawn dashed.
+        reference: {task: (accuracy, label)}, a published figure drawn as a dotted line.
+            For a task that did not train, it is what keeps the y-axis honest: without it
+            the axis zooms to the noise around chance and a flat line looks like movement.
     """
     tasks = _tasks(history)
     fig, axes = plt.subplots(1, len(tasks), figsize=(4.4 * len(tasks), 3.3),
                              squeeze=False)
+    handles = {}
     for ax, task in zip(axes[0], tasks):
         sub = history[history["task"] == task]
         per_design = (sub.groupby(["variant", "design_id", "epoch"])["val_accuracy"]
                       .mean().reset_index())
         arms = [a for a in ARM_ORDER if a in set(per_design["variant"])]
+        ends = {}
         for arm in [a for a in arms if a != "flash"] + (["flash"] if "flash" in arms else []):
             curves = per_design[per_design["variant"] == arm].pivot(
                 index="epoch", columns="design_id", values="val_accuracy")
@@ -293,25 +327,78 @@ def learning_curve_figure(history: pd.DataFrame, path, chance: dict | None = Non
                              for _, r in curves.iterrows()])
             ax.fill_between(epochs, band[:, 0], band[:, 1], color=ARM_COLOR[arm],
                             alpha=0.15, linewidth=0)
-            ax.plot(epochs, mean, color=ARM_COLOR[arm], linewidth=2.0,
-                    label=ARM_LABEL[arm])
-            # Direct label at the line's end, in neutral ink beside a coloured mark.
-            ax.text(epochs[-1] + 0.3, mean[-1], ARM_LABEL[arm].split(" ")[0],
-                    fontsize=7, color=INK, va="center")
+            (line,) = ax.plot(epochs, mean, color=ARM_COLOR[arm], linewidth=2.0)
+            handles[arm] = line
+            ends[arm] = (epochs[-1], mean[-1])
+
         if chance and task in chance:
             ax.axhline(chance[task], color=INK_2, linewidth=0.9, linestyle=(0, (4, 3)))
+        if reference and task in reference:
+            value, label = reference[task]
+            ax.axhline(value, color=INK_2, linewidth=0.9, linestyle=(0, (1, 2)))
+            ax.text(1.2, value, f" {label}", fontsize=7, color=INK_2, va="bottom")
+
+        # Keep the y-axis at least 0.10 tall. A task stuck at chance otherwise zooms to a
+        # band a few thousandths wide, and sampling noise reads as a learning curve.
+        lo, hi = ax.get_ylim()
+        if reference and task in reference:
+            hi = max(hi, reference[task][0] + 0.03)
+        if hi - lo < 0.10:
+            mid = (hi + lo) / 2
+            lo, hi = mid - 0.05, mid + 0.05
+        ax.set_ylim(lo, hi)
+
+        # Direct labels at the line ends, spread so close finishers do not overprint. When
+        # every arm finishes in the same place (a task that did not train), five spread
+        # labels would only point at one line, so a single label names them all.
+        names = list(ends)
+        finals = [ends[a][1] for a in names]
+        if max(finals) - min(finals) < 0.02 * (hi - lo):
+            x_end = max(ends[a][0] for a in names)
+            ax.text(x_end + 0.6, float(np.mean(finals)), "All five\narms",
+                    fontsize=7, color=INK, va="center")
+            names = []
+        ys = _spread([ends[a][1] for a in names], min_gap=0.055 * (hi - lo))
+        for arm, y in zip(names, ys):
+            x_end, y_end = ends[arm]
+            ax.annotate(ARM_LABEL[arm].split(" ")[0], (x_end, y_end),
+                        xytext=(x_end + 0.6, y), textcoords="data", fontsize=7,
+                        color=INK, va="center",
+                        arrowprops=dict(arrowstyle="-", color=GRID, linewidth=0.6,
+                                        shrinkA=0, shrinkB=0)
+                        if abs(y - y_end) > 0.01 * (hi - lo) else None)
+
         ax.set_title(TASK_LABEL.get(task, task), fontsize=10, color=INK, pad=6)
         ax.set_xlabel("Epoch", fontsize=8.5, color=INK)
         ax.set_ylabel("Validation accuracy", fontsize=8.5, color=INK)
-        ax.set_xlim(left=1)
+        last_epoch = max(e for e, _ in ends.values())
+        ax.set_xlim(1, last_epoch + 3.2)
+        ax.set_xticks([t for t in (1, 5, 10, 15, 20, 25, 30) if t <= last_epoch])
         _style(ax)
-    axes[0][0].legend(fontsize=7, frameon=False, loc="lower right")
+
+    # One legend for the figure, below the panels, so it never sits on a curve.
+    order = [a for a in ARM_ORDER if a in handles]
+    fig.legend([handles[a] for a in order], [ARM_LABEL[a] for a in order],
+               loc="lower center", ncol=len(order), frameon=False, fontsize=8,
+               bbox_to_anchor=(0.5, -0.08))
     if title:
         fig.suptitle(title, fontsize=10.5, color=INK, y=1.03)
     fig.tight_layout()
     fig.savefig(path, bbox_inches="tight", dpi=200)
     plt.close(fig)
     return Path(path)
+
+
+def _plain_log_ticks(ax):
+    """Label a log axis with ordinary numbers (100, 200, 400) instead of 2x10^2."""
+    from matplotlib.ticker import FixedLocator, NullFormatter, FuncFormatter
+    lo, hi = ax.get_xlim()
+    candidates = [20, 30, 50, 75, 100, 150, 200, 300, 400, 500, 600, 800,
+                  1000, 1500, 2000, 3000, 5000]
+    ticks = [t for t in candidates if lo <= t <= hi]
+    ax.xaxis.set_major_locator(FixedLocator(ticks))
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
+    ax.xaxis.set_minor_formatter(NullFormatter())
 
 
 def tradeoff_figure(cells: pd.DataFrame, path, title: str | None = None):
@@ -321,7 +408,8 @@ def tradeoff_figure(cells: pd.DataFrame, path, title: str | None = None):
     the interquartile range over designs. Upper-left is better on both counts. All five
     arms share the plot with no positional order, and the categorical hues do not clear the
     all-pairs separation floor, so identity is carried by a direct label on every point and
-    every mark is the same neutral colour.
+    every mark is the same neutral colour. Labels are spread apart where points crowd, with
+    a thin leader line back to the point they name.
     """
     tasks = [t for t in _tasks(cells)
              if cells.loc[cells["task"] == t, "best_val_accuracy"].notna().any()]
@@ -329,6 +417,7 @@ def tradeoff_figure(cells: pd.DataFrame, path, title: str | None = None):
                              squeeze=False)
     for ax, task in zip(axes[0], tasks):
         sub = cells[cells["task"] == task]
+        points = {}
         for arm in _arms_present(sub):
             a = sub[sub["variant"] == arm]
             x = a["mean_train_seconds_per_epoch"]
@@ -340,15 +429,41 @@ def tradeoff_figure(cells: pd.DataFrame, path, title: str | None = None):
                     linewidth=1.0)
             ax.scatter([xm], [ym], s=48, color=INK, edgecolor="white", linewidth=1.0,
                        zorder=3)
-            ax.annotate(ARM_LABEL[arm].replace(" (baseline)", "*"), (xm, ym),
-                        xytext=(6, 5), textcoords="offset points", fontsize=8,
-                        color=INK)
+            points[arm] = (xm, ym)
         ax.set_xscale("log")
+        _style(ax)
+        ax.xaxis.grid(True, color=GRID, linewidth=0.7, which="major")
+        _plain_log_ticks(ax)
+
+        # Place labels in axes-fraction space: cluster points that sit near each other
+        # horizontally, then spread each cluster's labels vertically.
+        to_axes = ax.transData + ax.transAxes.inverted()
+        frac = {arm: to_axes.transform(xy) for arm, xy in points.items()}
+        arms = sorted(frac, key=lambda a: frac[a][0])
+        clusters, current = [], [arms[0]]
+        for arm in arms[1:]:
+            if frac[arm][0] - frac[current[-1]][0] < 0.14:
+                current.append(arm)
+            else:
+                clusters.append(current)
+                current = [arm]
+        clusters.append(current)
+        for cluster in clusters:
+            ys = _spread([frac[a][1] + 0.05 for a in cluster], min_gap=0.095)
+            for arm, ly in zip(cluster, ys):
+                fx, fy = frac[arm]
+                lx = fx + 0.045
+                name = ARM_LABEL[arm].replace(" (baseline)", "*")
+                moved = abs(ly - (fy + 0.05)) > 0.005
+                ax.annotate(name, (fx, fy), xycoords="axes fraction",
+                            xytext=(lx, ly), textcoords="axes fraction",
+                            fontsize=8, color=INK, va="center",
+                            arrowprops=dict(arrowstyle="-", color=INK_2, linewidth=0.6,
+                                            shrinkA=0, shrinkB=3) if moved else None)
+
         ax.set_title(TASK_LABEL.get(task, task), fontsize=10, color=INK, pad=6)
         ax.set_xlabel("Training time per epoch (s, log scale)", fontsize=8.5, color=INK)
         ax.set_ylabel("Best validation accuracy", fontsize=8.5, color=INK)
-        _style(ax)
-        ax.xaxis.grid(True, color=GRID, linewidth=0.7, which="both")
     fig.text(0.01, -0.02, "* baseline.  Point = mean over designs; whiskers = IQR over "
              "designs.  Up and to the left is better.", fontsize=7, color=INK_2)
     if title:
@@ -357,6 +472,30 @@ def tradeoff_figure(cells: pd.DataFrame, path, title: str | None = None):
     fig.savefig(path, bbox_inches="tight", dpi=200)
     plt.close(fig)
     return Path(path)
+
+
+def significant_vs_baseline(cells: pd.DataFrame, metric: str, baseline="flash",
+                            method="finner", alpha=0.05) -> dict:
+    """Which arms the pre-specified post-hoc declares different from the baseline.
+
+    Computed per scope (pooled, then each task) with the same ranking and correction as
+    run.py, so the stars on a figure can never disagree with the results table.
+
+    Returns:
+        {scope: set of arms}.
+    """
+    from . import posthoc
+    scopes = {"pooled": cells}
+    if cells["task"].nunique() > 1:
+        scopes.update({t: cells[cells["task"] == t] for t in _tasks(cells)})
+    out = {}
+    for scope, sub in scopes.items():
+        ranked = aggregate.rank_within_blocks(sub, metric)
+        n_blocks = sub[aggregate.BLOCK_KEYS].drop_duplicates().shape[0]
+        result = posthoc.compare_to_control(aggregate.mean_ranks(ranked), baseline,
+                                            n_blocks, metric, method=method, alpha=alpha)
+        out[scope] = set(result.table.loc[result.table["reject"], "variant"])
+    return out
 
 
 # --------------------------------------------------------------------------------------
@@ -410,7 +549,9 @@ def main():
                       "Best validation accuracy", chance=chance)
     paired_difference_figure(acc_cells, "best_val_accuracy",
                              out / f"fig_accuracy_paired_diff.{ext}",
-                             "Difference from Flash (accuracy points)", scale=100.0)
+                             "Difference from Flash (accuracy points)", scale=100.0,
+                             significant=significant_vs_baseline(acc_cells,
+                                                                 "best_val_accuracy"))
     for metric, label in (("mean_train_seconds_per_epoch", "Seconds per epoch"),
                           ("peak_memory_mb", "Peak GPU memory (MB)")):
         if metric in cells.columns:
@@ -420,7 +561,11 @@ def main():
 
     history = load_histories(args.results_dir, args.phase)
     if not history.empty:
-        learning_curve_figure(history, out / f"fig_learning_curves.{ext}", chance=chance)
+        # LRA's published Transformer result for Pathfinder, so a reader sees how far the
+        # flat line sits from what the task can reach (Tay et al., 2021, Table 1).
+        reference = {"pathfinder": (0.714, "LRA Transformer, 71.4%")}
+        learning_curve_figure(history, out / f"fig_learning_curves.{ext}", chance=chance,
+                              reference=reference)
 
     for metric in metrics:
         source = acc_cells if metric == "best_val_accuracy" else cells
