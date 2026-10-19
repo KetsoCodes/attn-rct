@@ -26,3 +26,4 @@ wandb/
 cluster/runs.csv
 kaggle.json
 **/kaggle.json
+report/
