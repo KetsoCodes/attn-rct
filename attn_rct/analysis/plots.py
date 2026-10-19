@@ -1,9 +1,20 @@
-"""Visualizations and summary tables for the experimental results.
+"""Critical-difference diagrams and the summary results table.
 
-Generates Critical-Difference (CD) diagrams, results tables, and cross-task 
-ranking plots. Visualizations are built directly from prior statistical 
-decisions (e.g., Finner post-hoc cliques) to ensure the figures perfectly 
-match the numerical reports without recomputing any metrics.
+The critical-difference diagram is the standard way to show a Demsar comparison: variants
+sit on a rank axis, best on the left, and a bar joins any set the post-hoc cannot tell
+apart. The one subtlety that matters here is which post-hoc the bar reflects.
+
+The textbook CD bar is the Nemenyi critical difference, an all-pairs quantity. This study
+reports Finner comparisons against a control, which is a different and more powerful test.
+If the diagram drew a Nemenyi bar over Finner results, the figure could join two arms the
+table separates -- the picture contradicting the numbers. So the connecting groups come
+from posthoc.cliques, which derives them from the decisions the reported post-hoc actually
+made. The Nemenyi critical difference is still drawn, as a labelled scale bar, so the
+reader can see the all-pairs threshold; it just is not what the connecting lines encode.
+
+Nothing here recomputes a statistic. The figures and the table are views of results the
+omnibus, post-hoc and effect stages already produced, so a number can never appear in a
+plot that disagrees with the table it came from.
 """
 
 from __future__ import annotations
@@ -11,7 +22,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")            # Headless: render to files, never to a display
+matplotlib.use("Agg")            # headless: render to files, never to a display
 import matplotlib.pyplot as plt
 import pandas as pd
 
@@ -19,7 +30,7 @@ from . import posthoc
 
 
 def _draw_bar(ax, mean_ranks, run, y):
-    """Draws one connecting bar across a run of rank-adjacent, indistinguishable arms."""
+    """Draw one connecting bar across a run of rank-adjacent, indistinguishable arms."""
     if len(run) < 2:
         return
     positions = [mean_ranks[v] for v in run]
@@ -30,15 +41,18 @@ def _draw_bar(ax, mean_ranks, run, y):
 def critical_difference_diagram(mean_ranks: pd.Series, posthoc_result,
                                 title: str, path, cd: float | None = None,
                                 figsize=(8.0, 2.6)):
-    """Draws a critical-difference diagram from mean ranks and post-hoc results.
+    """Draw a critical-difference diagram from a mean-rank series and a post-hoc result.
 
     Args:
-        mean_ranks: Mean rank per variant.
-        posthoc_result: PostHocResult defining the indistinguishable groups.
-        title: Figure title.
-        path: Output file path (.svg or .png).
-        cd: Nemenyi critical difference for the scale bar (computed if omitted).
-        figsize: Figure dimensions in inches.
+        mean_ranks: mean rank per variant (aggregate.mean_ranks).
+        posthoc_result: the PostHocResult whose decisions define the connecting groups.
+        title: figure title.
+        path: output file (.svg or .png).
+        cd: Nemenyi critical difference to draw as a scale bar; computed if omitted.
+        figsize: figure size in inches.
+
+    Returns:
+        The path written.
     """
     ordered = mean_ranks.sort_values()
     variants = list(ordered.index)
@@ -53,8 +67,9 @@ def critical_difference_diagram(mean_ranks: pd.Series, posthoc_result,
     groups = posthoc.cliques(mean_ranks, posthoc_result)
 
     fig, ax = plt.subplots(figsize=figsize)
-    ax.set_xlim(low - 0.5, high + 0.5)
-    ax.set_ylim(-0.15, 1)
+    margin = 1.6                      # room either side for the elbowed labels
+    ax.set_xlim(low - margin, high + margin)
+    ax.set_ylim(-0.05, 1.12)
     ax.axis("off")
 
     axis_y = 0.75
@@ -63,26 +78,27 @@ def critical_difference_diagram(mean_ranks: pd.Series, posthoc_result,
         ax.plot([tick, tick], [axis_y, axis_y + 0.03], "k-", linewidth=1.0)
         ax.text(tick, axis_y + 0.07, str(tick), ha="center", va="bottom", fontsize=9)
 
-    # Stagger labels to prevent text overlap for closely ranked variants.
-    depths = []
-    last_rank = None
-    level = 0
-    for rank in ranks:
-        if last_rank is not None and abs(rank - last_rank) < 0.4:
-            level += 1
-        else:
-            level = 0
-        depths.append(level)
-        last_rank = rank
-        
-    label_ys = [0.45, 0.28, 0.11, -0.06]
+    # Demsar's layout: the better half of the arms elbow down and out to labels on the
+    # LEFT, the worse half to labels on the RIGHT, each successive arm one row lower. A
+    # label therefore never sits on a stem, however close two mean ranks are -- an earlier
+    # version centred each label on its own stem and tied ranks overprinted the lines.
+    n_left = (k + 1) // 2
+    row_step = 0.62 / max(n_left, k - n_left, 1)
     for i, (variant, rank) in enumerate(zip(variants, ranks)):
-        y = label_ys[min(depths[i], len(label_ys) - 1)]
-        ax.plot([rank, rank], [axis_y, y + 0.04], "k-", linewidth=0.8)
-        ax.text(rank, y, f"{variant}\n{rank:.2f}", ha="center", va="top", fontsize=9)
+        left = i < n_left
+        row = i if left else (k - 1 - i)          # outermost arms on the top row
+        y = axis_y - 0.22 - row * row_step
+        x_end = low - 0.25 if left else high + 0.25
+        ax.plot([rank, rank], [axis_y, y], "k-", linewidth=0.8)
+        ax.plot([rank, x_end], [y, y], "k-", linewidth=0.8)
+        ax.text(x_end + (-0.06 if left else 0.06), y, f"{variant} ({rank:.2f})",
+                ha="right" if left else "left", va="center", fontsize=9)
 
-    # Draw connecting bars for indistinguishable groups based on post-hoc cliques.
-    # We bridge only runs of rank-adjacent members to avoid visually spanning excluded arms.
+    # Connecting bars for groups the post-hoc cannot separate. A group may not be
+    # contiguous in rank order (a control family can tie the baseline with a distant arm
+    # while separating a nearer one), and a bar drawn straight across would visually span
+    # the arm in between. So within each group we bridge only runs of rank-adjacent
+    # members, which never crosses an excluded arm.
     rank_order = list(mean_ranks.sort_values().index)
     bar_y = axis_y - 0.06
     depth = 0
@@ -99,23 +115,27 @@ def critical_difference_diagram(mean_ranks: pd.Series, posthoc_result,
         _draw_bar(ax, mean_ranks, run, bar_y - depth * 0.04)
         depth += 1
 
-    # Nemenyi CD scale bar for reference (all-pairs threshold).
-    ax.plot([low, low + cd], [0.93, 0.93], "k-", linewidth=1.5)
-    ax.plot([low, low], [0.91, 0.95], "k-", linewidth=1.0)
-    ax.plot([low + cd, low + cd], [0.91, 0.95], "k-", linewidth=1.0)
-    ax.text(low + cd / 2, 0.97, f"CD = {cd:.2f}", ha="center", va="bottom", fontsize=8)
+    # CD scale bar, top-left, labelled -- the all-pairs threshold for reference.
+    ax.plot([low, low + cd], [0.98, 0.98], "k-", linewidth=1.5)
+    ax.plot([low, low], [0.96, 1.00], "k-", linewidth=1.0)
+    ax.plot([low + cd, low + cd], [0.96, 1.00], "k-", linewidth=1.0)
+    ax.text(low + cd + 0.08, 0.98, f"Nemenyi CD = {cd:.2f}", ha="left", va="center",
+            fontsize=8)
 
-    ax.set_title(title, fontsize=11, pad=2)
-    fig.savefig(path, bbox_inches="tight", dpi=150)
+    ax.set_title(title, fontsize=11, pad=8)
+    fig.savefig(path, bbox_inches="tight", dpi=200)
     plt.close(fig)
     return Path(path)
 
 
 def results_table(omnibus_result, posthoc_result, effect_result) -> pd.DataFrame:
-    """Assembles a tidy DataFrame joining ranks, adjusted p-values, and effect sizes.
+    """Assemble one tidy table joining ranks, adjusted p-values, and effect sizes.
+
+    Every column comes from a stage that already computed it, so the table cannot drift
+    from the figures. One row per variant; the baseline row is marked.
 
     Returns:
-        A DataFrame ordered by mean rank, with the baseline row explicitly marked.
+        A DataFrame ordered by mean rank.
     """
     baseline = posthoc_result.baseline
     ranks = omnibus_result.mean_ranks
@@ -147,14 +167,21 @@ def results_table(omnibus_result, posthoc_result, effect_result) -> pd.DataFrame
 
 def task_comparison_figure(per_task_ranks: dict, metric: str, title: str, path,
                            figsize=(8.0, 4.0)):
-    """Plots mean ranks per variant across tasks to highlight performance shifts.
+    """Plot mean ranks per variant across tasks side by side, to show cross-task change.
 
     Args:
-        per_task_ranks: Dictionary mapping task names to mean_ranks Series.
-        metric: Metric name for the y-axis label.
-        title: Figure title.
-        path: Output file path.
-        figsize: Figure dimensions in inches.
+        per_task_ranks: {task_name: mean_ranks Series} for one metric.
+        metric: metric name, for the axis label.
+        title: figure title.
+        path: output file.
+
+    Returns:
+        The path written.
+
+    The point of this figure is the one thing pooling hides: whether the ranking is the
+    same on every task or moves. A variant whose line stays flat ranks consistently; a
+    variant whose line crosses others is task-dependent, which is the finding the study
+    most wants to surface.
     """
     tasks = list(per_task_ranks)
     variants = sorted(next(iter(per_task_ranks.values())).index)
@@ -168,11 +195,10 @@ def task_comparison_figure(per_task_ranks: dict, metric: str, title: str, path,
     ax.set_xticks(range(len(tasks)))
     ax.set_xticklabels(tasks)
     ax.set_ylabel(f"mean rank ({metric})\nlower is better")
-    ax.invert_yaxis()  # Rank 1 at the top (visually higher is better)
+    ax.invert_yaxis()            # rank 1 at the top, so "up" reads as "better"
     ax.set_title(title, fontsize=11)
     ax.grid(axis="y", linestyle=":", alpha=0.5)
     ax.margins(x=0.15)
-    
     fig.savefig(path, bbox_inches="tight", dpi=150)
     plt.close(fig)
     return Path(path)

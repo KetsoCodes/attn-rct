@@ -1,10 +1,10 @@
-"""This is my training entry point for a single (design, variant, seed) experimental cell.
+"""Training entry point for a single experimental cell.
 
-It runs one training session based on the Slurm array index mapped to my manifest. 
-I included periodic checkpointing and clean signal handling so runs survive cluster 
-preemptions, which keeps the RNG state intact for strict experimental pairing.
+Executes a training run specified by a Slurm array index mapped against the manifest.
+Includes periodic checkpointing and clean signal handling to survive cluster preemption 
+while preserving RNG state for strict experimental pairing.
 
-It finishes by writing a single JSON file with the averaged metrics.
+Produces a single JSON file containing the averaged metrics.
 """
 
 from __future__ import annotations
@@ -30,15 +30,13 @@ EXIT_REQUEUE = 42
 
 
 def handle_signal(signum, frame):
-    """Catches Slurm walltime warnings or kill signals so I can trigger a clean exit."""
+    """Flags when a Slurm walltime warning or kill signal is received to trigger a clean exit."""
     global INTERRUPTED
-    print(f"\n[signal {signum}] walltime approaching -- checkpointing and exiting",
-          flush=True)
+    print(f"\n[signal {signum}] walltime approaching -- checkpointing and exiting", flush=True)
     INTERRUPTED = True
 
 
 def parse_args():
-    """Parses command-line arguments and my configuration overrides."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--row", type=int, required=True)
@@ -62,15 +60,14 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=None, help="override the manifest")
     parser.add_argument("--compute-dtype", default=None,
                         choices=["fp32", "bf16", "fp16", "auto"],
-                        help="override the manifest's attention compute precision; "
-                             "note the flash arm's kernels accept only fp16/bf16")
+                        help="override attention compute precision; flash requires fp16/bf16")
     parser.add_argument("--warmup-steps", type=int, default=None,
                         help="linear LR warmup over this many steps; 0 disables it")
     return parser.parse_args()
 
 
 def load_manifest_row(manifest: Path, row_index: int) -> SimpleNamespace:
-    """Grabs a specific row from the manifest CSV and casts the numbers properly."""
+    """Reads a specific row from the manifest CSV, casting numerical fields."""
     with open(manifest, newline="") as handle:
         rows = list(csv.DictReader(handle))
     if not 1 <= row_index <= len(rows):
@@ -91,7 +88,7 @@ def load_manifest_row(manifest: Path, row_index: int) -> SimpleNamespace:
 
 
 def resolve_config(args) -> SimpleNamespace:
-    """Combines the manifest config with any command-line overrides I pass in."""
+    """Combines the manifest row configuration with command-line overrides."""
     cfg = load_manifest_row(Path(args.manifest), args.row)
     cfg.attention = cfg.variant
 
@@ -105,10 +102,8 @@ def resolve_config(args) -> SimpleNamespace:
     if args.d_model is not None:
         cfg.d_ff = 4 * cfg.d_model
 
-    # I leave warmup OFF by default so every run made before it existed is reproduced exactly.
     if args.warmup_steps is not None:
-        print(f"[override] warmup_steps: "
-              f"{getattr(cfg, 'warmup_steps', 0)} -> {args.warmup_steps}")
+        print(f"[override] warmup_steps: {getattr(cfg, 'warmup_steps', 0)} -> {args.warmup_steps}")
         cfg.warmup_steps = args.warmup_steps
     elif not hasattr(cfg, "warmup_steps"):
         cfg.warmup_steps = 0
@@ -117,26 +112,17 @@ def resolve_config(args) -> SimpleNamespace:
     return cfg
 
 
+def resolve_accumulation(cfg) -> tuple[int, int]:
+    """Splits the batch size into micro-batches for memory limits (e.g., Text task)."""
+    accum = int(getattr(cfg, "grad_accum_steps", 1) or 1)
+    batch = int(cfg.batch_size)
+    if accum < 1 or batch % accum:
+        raise ValueError(f"batch_size {batch} is not divisible into {accum} micro-batches")
+    return batch // accum, accum
+
+
 def apply_warmup(optimizer, base_lr: float, global_step: int, warmup_steps: int) -> float:
-    """Linearly ramps the learning rate from 0 to base_lr over the first warmup_steps.
-
-    Without a warmup, Transformers on tasks like Pathfinder just sit at chance forever.
-    The first massive updates hit before the attention mechanism has time to organize,
-    and the model never recovers. Adding a plain linear ramp (like the original LRA recipe)
-    is the smallest change I can make to test that hypothesis.
-
-    If warmup_steps is 0, the optimizer is untouched, meaning my older runs stay perfectly 
-    reproducible.
-
-    Args:
-        optimizer: the optimizer whose param groups carry the learning rate.
-        base_lr: the configured learning rate, the value warmup ramps up to.
-        global_step: steps completed since the start of training, not of this session.
-        warmup_steps: length of the ramp; 0 disables it.
-
-    Returns:
-        The learning rate now in effect, for logging.
-    """
+    """Linearly ramps the learning rate from 0 to base_lr over warmup_steps."""
     if not warmup_steps:
         return base_lr
     scale = min(1.0, (global_step + 1) / float(warmup_steps))
@@ -147,16 +133,15 @@ def apply_warmup(optimizer, base_lr: float, global_step: int, warmup_steps: int)
 
 
 def serialisable_config(cfg) -> dict:
-    """Strips out private attributes so I can dump the config to JSON safely."""
     return {k: v for k, v in vars(cfg).items() if not k.startswith("_")}
 
 
 def evaluate(model, loader, device, limit_batches=None):
-    """Runs the model against the validation set."""
     model.eval()
     correct = total = 0
     loss_sum = 0.0
     criterion = nn.CrossEntropyLoss()
+    
     with torch.no_grad():
         for i, (tokens, mask, targets) in enumerate(loader):
             if limit_batches and i >= limit_batches:
@@ -166,12 +151,13 @@ def evaluate(model, loader, device, limit_batches=None):
             loss_sum += criterion(logits, targets).item() * targets.size(0)
             correct += (logits.argmax(dim=-1) == targets).sum().item()
             total += targets.size(0)
+            
     model.train()
     return correct / max(total, 1), loss_sum / max(total, 1)
 
 
 def save_checkpoint(path, model, optimizer, epoch, best_accuracy):
-    """Writes a resumable checkpoint atomically so I don't corrupt files if it crashes mid-write."""
+    """Writes a resumable checkpoint atomically to prevent corruption."""
     tmp = Path(str(path) + ".tmp")
     torch.save({
         "epoch": epoch,
@@ -186,7 +172,7 @@ def save_checkpoint(path, model, optimizer, epoch, best_accuracy):
 
 
 def resume(checkpoint_path, model, optimizer, device):
-    """Loads the model weights, optimizer state, and RNG state if I have a checkpoint."""
+    """Restores weights, optimizer state, and RNG state from a checkpoint."""
     if not checkpoint_path.exists():
         return 0, 0.0
 
@@ -204,9 +190,7 @@ def resume(checkpoint_path, model, optimizer, device):
 
 
 def start_wandb(args, cfg, n_params, vocab_size):
-    """Fires up Weights & Biases logging if my API key is set."""
-    enabled = (os.environ.get("WANDB_API_KEY")
-               or os.environ.get("WANDB_MODE") == "offline")
+    enabled = (os.environ.get("WANDB_API_KEY") or os.environ.get("WANDB_MODE") == "offline")
     if not enabled:
         return None
 
@@ -231,7 +215,7 @@ def start_wandb(args, cfg, n_params, vocab_size):
 
 
 def write_json_atomic(path: Path, payload: dict):
-    """Writes the final JSON payload atomically to prevent corrupted files on interruption."""
+    """Writes JSON atomically to prevent corrupted files on interruption."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(".json.tmp")
     with open(tmp_path, "w") as handle:
@@ -240,7 +224,6 @@ def write_json_atomic(path: Path, payload: dict):
 
 
 def build_result(cfg, args, history, n_params, backend, best_accuracy) -> dict:
-    """Pulls together the final results payload for my analysis script."""
     latest = history[-1] if history else {}
     return {
         "run_id": cfg.run_id,
@@ -274,19 +257,24 @@ def main():
 
     data_dir = args.data_dir or getattr(cfg, "data_dir", None)
     if data_dir is None:
-        raise SystemExit(
-            "no data directory: pass --data-dir or include data_dir in the manifest"
-        )
+        raise SystemExit("no data directory: pass --data-dir or include data_dir in the manifest")
+        
+    micro_batch, accum_steps = resolve_accumulation(cfg)
     train_loader, val_loader, meta = build_dataloaders(
-        cfg.task, data_dir, cfg.max_len, cfg.batch_size, cfg.seed, args.num_workers,
+        cfg.task, data_dir, cfg.max_len, micro_batch, cfg.seed, args.num_workers,
     )
     print(f"task: {cfg.task} | vocab: {meta['vocab_size']} | "
           f"classes: {meta['n_classes']} | train batches: {len(train_loader)} "
           f"| val batches: {len(val_loader)}")
+          
+    if accum_steps > 1:
+        print(f"[accumulation] effective batch {cfg.batch_size} = "
+              f"{accum_steps} micro-batches of {micro_batch}")
 
     torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.seed)
+        
     model = TransformerClassifier(
         cfg, vocab_size=meta["vocab_size"], n_classes=meta["n_classes"]
     ).to(device)
@@ -310,22 +298,17 @@ def main():
 
     if start_epoch >= int(cfg.epochs):
         print(f"WARNING: checkpoint is at epoch {start_epoch} and target is "
-              f"{cfg.epochs} -- nothing to train. Timing/memory will be null. "
-              f"Delete {checkpoint_path.parent} to force a fresh run.")
+              f"{cfg.epochs} -- nothing to train. Delete {checkpoint_path.parent} to restart.")
 
     last_checkpoint = time.time()
     history = []
-    
-    # I count this across the whole session, not per epoch. If a run silently stops learning,
-    # I want one single number my analysis script can screen for.
     nonfinite_grad_steps = 0
     
-    # Warmup is tied to the global step. If I resume a run, it continues the ramp from where
-    # it left off instead of restarting it (which would just re-apply tiny updates).
     base_lr = float(cfg.lr)
     warmup_steps = int(getattr(cfg, "warmup_steps", 0) or 0)
-    batches_per_epoch = len(train_loader)
+    batches_per_epoch = len(train_loader) // accum_steps
     current_lr = base_lr
+    
     if warmup_steps:
         print(f"[warmup] linear ramp to lr={base_lr} over {warmup_steps} steps "
               f"({warmup_steps / max(batches_per_epoch, 1):.2f} epochs)")
@@ -338,43 +321,41 @@ def main():
         for i, (tokens, mask, targets) in enumerate(train_loader):
             if args.limit_batches and i >= args.limit_batches:
                 break
+            if i >= batches_per_epoch * accum_steps:
+                break
+                
             tokens, mask, targets = tokens.to(device), mask.to(device), targets.to(device)
-
-            current_lr = apply_warmup(
-                optimizer, base_lr, epoch * batches_per_epoch + i, warmup_steps
-            )
-            optimizer.zero_grad(set_to_none=True)
-            loss = criterion(model(tokens, mask), targets)
-            loss.backward()
+            step, micro = divmod(i, accum_steps)
             
-            # I left the clipping math exactly as it was, so every result I ran before adding 
-            # this counter is perfectly reproducible. I'm just looking at the return value now.
-            #
-            # Here's why I'm counting it: `clip_grad_norm_` scales gradients by max_norm/total_norm.
-            # If the total_norm is infinite, the coefficient becomes 1/inf = 0, meaning the optimizer 
-            # applies an update of exactly zero. The loss freezes, but training happily reports 
-            # success instead of throwing a NaN or crashing. That's exactly what trapped my 1e-2 
-            # Pathfinder runs. Since PyTorch is silently failing here, I need to count these 
-            # non-finite steps and track them with the results.
+            if micro == 0:
+                current_lr = apply_warmup(
+                    optimizer, base_lr, epoch * batches_per_epoch + step, warmup_steps
+                )
+                optimizer.zero_grad(set_to_none=True)
+                
+            loss = criterion(model(tokens, mask), targets)
+            (loss / accum_steps).backward()
+            running_loss += loss.item() * targets.size(0)
+            seen += targets.size(0)
+            
+            if micro != accum_steps - 1:
+                continue
+
             total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             if not torch.isfinite(total_norm):
                 nonfinite_grad_steps += 1
                 if nonfinite_grad_steps in (1, 10, 100, 1000):
                     print(f"WARNING: non-finite gradient norm at epoch {epoch} step {i} "
-                          f"({nonfinite_grad_steps} so far). Clipping scales this update "
-                          f"to zero, so the model is not learning from these steps.",
+                          f"({nonfinite_grad_steps} so far). Model is not learning here.",
                           flush=True)
+                          
             optimizer.step()
-
-            running_loss += loss.item() * targets.size(0)
-            seen += targets.size(0)
 
             if INTERRUPTED:
                 save_checkpoint(checkpoint_path, model, optimizer, epoch - 1, best_accuracy)
                 if run:
                     run.finish()
-                print(f"checkpointed on signal at epoch {epoch}; "
-                      f"exiting {EXIT_REQUEUE} to request requeue")
+                print(f"checkpointed on signal at epoch {epoch}; exiting {EXIT_REQUEUE}")
                 sys.exit(EXIT_REQUEUE)
 
             if (time.time() - last_checkpoint) / 60 > args.checkpoint_every_min:
@@ -394,10 +375,13 @@ def main():
             "lr": current_lr,
             "nonfinite_grad_steps": nonfinite_grad_steps,
         }
+        
         if torch.cuda.is_available():
             record["peak_memory_mb"] = torch.cuda.max_memory_allocated() / 1e6
+            
         history.append(record)
         print(f"epoch {epoch}: {record}", flush=True)
+        
         if run:
             run.log(record)
 

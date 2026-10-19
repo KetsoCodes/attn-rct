@@ -1,0 +1,686 @@
+% =============================================================================
+% Applications of Algorithms (COMS4032A / COMS7041A) -- Assignment 2
+% Binary Search Trees and Order-Statistic Trees
+% Build:  pdflatex report.tex && pdflatex report.tex   (figures in ./figs/)
+% =============================================================================
+
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+\graphicspath{{figs/}}
+
+\newcommand{\INS}{\textsc{Tree-Insert}}
+\newcommand{\DEL}{\textsc{Tree-Delete}}
+\newcommand{\WALK}{\textsc{Inorder-Tree-Walk}}
+\newcommand{\SEL}{\textsc{OS-Select}}
+\newcommand{\RANK}{\textsc{OS-Rank}}
+\newcommand{\TRANS}{\textsc{Transplant}}
+\newcommand{\NIL}{\textsc{nil}}
+\newcommand{\new}{\textcolor{blue!60!black}{$\blacktriangleleft$ new}}
+\algrenewcommand\algorithmiccomment[1]{\hfill{\footnotesize #1}}
+
+\begin{document}
+
+\title{Empirical Analysis of Randomly Built Binary Search Trees and Order-Statistic Trees}
+
+\author{\IEEEauthorblockN{Fortune Mnisi}
+\IEEEauthorblockA{Student number: 1903697\\
+School of Computer Science and Applied Mathematics\\
+University of the Witwatersrand, Johannesburg\\
+COMS4032A/COMS7041A: Applications of Algorithms}}
+
+\maketitle
+
+\begin{abstract}
+The binary search tree operations \INS{}, \DEL{} and \WALK{} from Cormen
+\textit{et al.}~\cite{clrs}, and an order-statistic tree built on a plain
+(unbalanced) binary search tree supporting \SEL{} and \RANK{}, were implemented
+in Java and evaluated on 18\,612 randomly built trees with up to
+$n = 2^{22}$ keys. The mean tree height grew as $2.86\lg n - 7.7$, consistent
+with Theorem~12.4 and with the slope of the known asymptotic expansion over the
+same range, and stayed below the bound derived in the textbook at every size.
+Instrumented runs showed that building and destroying a tree visit
+$\Theta(n\lg n)$ nodes, matching their exact expected counts to within about 3\%.
+Running times, however, grew faster than the operation counts: the cost of
+visiting one node rose from about \SI{6}{\nano\second} to
+\SI{100}{\nano\second} once the tree outgrew the processor caches. The same
+effect made the $\Theta(n)$ inorder walk scale as $n^{1.41}$; laying the nodes
+out in key order cut this to $n^{1.23}$ and gave a $5.3\times$ speedup.
+Maintaining subtree sizes added almost nothing to insertion but made deletion
+of a random node about twice as slow on large trees, because plain \DEL{}
+touches only 1.75 nodes on average while the augmented version must update
+every ancestor up to the root. All four order-statistic operations did
+$\Theta(\lg n)$ work, with their time again dominated by cache misses.
+\end{abstract}
+
+\begin{IEEEkeywords}
+binary search trees, order-statistic trees, randomly built trees, tree height,
+empirical algorithmics, memory locality
+\end{IEEEkeywords}
+
+% -----------------------------------------------------------------------------
+\section{Introduction}
+
+A binary search tree (BST) supports its basic dynamic-set operations in $O(h)$
+time, where $h$ is the height of the tree. The height depends entirely on the
+order in which keys are inserted: sorted input produces a chain with
+$h = n-1$, while a random insertion order produces, on average, a much shallower
+tree. Theorem~12.4 (Section~12.4 of~\cite{clrs}) makes this precise, stating that a randomly
+built BST on $n$ distinct keys has expected height $O(\lg n)$.
+
+This report tests that claim empirically, measures the cost of building,
+destroying and walking random BSTs, and then augments the BST with a
+\emph{size} attribute to support order statistics. Throughout, the number of
+nodes an operation visits is separated from the time it takes, since on real
+hardware the two do not always grow at the same rate.
+
+% -----------------------------------------------------------------------------
+\section{Algorithms and Theoretical Analysis}
+
+\subsection{Binary Search Tree Operations}
+
+\WALK{} (Section~12.1 of~\cite{clrs}) and \INS{} and \DEL{}, with its
+helper \TRANS{} (Section~12.3), were coded exactly as given in the textbook,
+with \texttt{null} playing the role of
+\NIL{}. \INS{} follows a single root-to-leaf path and takes $O(h)$ time. Given a
+pointer to the node $z$, \DEL{} does constant work apart from the search for
+$z$'s successor when $z$ has two children, so it takes $O(h)$ time in the
+worst case but only time proportional to the height of $z$'s right subtree in
+general. \WALK{} visits each node once and runs in $\Theta(n)$ time
+regardless of the tree's shape (Theorem~12.1 of~\cite{clrs}).
+
+\subsection{Height of a Randomly Built BST}
+
+A randomly built BST is one produced by inserting $n$ distinct keys in an
+order chosen uniformly from the $n!$ permutations. Theorem~12.4 bounds the
+expected height via the exponential height $Y_n = 2^{X_n}$, showing that
+\begin{equation}
+E[Y_n] \le \tfrac{1}{4}\tbinom{n+3}{3}
+\;\Rightarrow\;
+E[X_n] \le \lg\!\left(\tfrac{1}{4}\tbinom{n+3}{3}\right),
+\label{eq:clrs}
+\end{equation}
+which is about $3\lg n$. Sharper results are known. Devroye~\cite{devroye} showed
+$E[X_n] \sim \alpha \ln n$ with $\alpha \approx 4.311$, and Reed~\cite{reed}
+refined this to
+\begin{equation}
+E[X_n] = \alpha\ln n - \beta\ln\ln n + O(1),
+\quad \beta = \frac{3}{2\ln(\alpha/2)} \approx 1.953.
+\label{eq:reed}
+\end{equation}
+Since $\alpha\ln n \approx 2.988\lg n$, the textbook bound~\eqref{eq:clrs} is
+close to tight in its leading constant. The $-\beta\ln\ln n$ term lowers the
+local slope with respect to $\lg n$ to
+$\ln 2\,(\alpha - \beta/\ln n)$, which is $2.87$ at $n = 2^{16}$.
+
+\subsection{Building, Destroying and Walking}
+
+Building a tree with $n$ calls to \INS{} visits, for each key, every ancestor
+of the position where it lands. The total number of nodes visited is
+therefore the internal path length of the final tree, whose expectation for a
+random BST is
+\begin{equation}
+E[\text{build visits}] = 2(n+1)H_n - 4n \sim 2n\ln n \approx 1.386\,n\lg n,
+\label{eq:build}
+\end{equation}
+where $H_n$ is the $n$th harmonic number~\cite{knuth}.
+
+Destroying the tree by calling \DEL{} on the root until it is empty costs, per
+call, a visit to the root plus, when the root has two children, a walk down
+the left spine of its right subtree to find the successor. Deleting with the
+successor in this way is known to leave the remaining tree random
+(Theorem~H in Section~6.2.2 of~\cite{knuth}, after Hibbard~\cite{hibbard}).
+When the root of a random tree of size $m$ has rank $r$, its right subtree is a
+random tree of size $m-r$, whose left spine has expected length $H_{m-r}$.
+Averaging over $r$ and summing over $m$ gives
+\begin{equation}
+E[\text{destroy visits}] = \sum_{m=1}^{n}\Bigl(1 + \frac{1}{m}\sum_{k=1}^{m-2}H_k\Bigr) \sim n\ln n,
+\label{eq:destroy}
+\end{equation}
+about half the cost of building. Both operations should therefore take
+$\Theta(n\lg n)$ expected time, with destruction roughly twice as fast.
+
+\subsection{Order-Statistic Trees}
+
+Following Section~14.1 of~\cite{clrs}, where \SEL{} and \RANK{} are given, each node $x$ stores
+$x.\mathit{size}$, the number of nodes in the subtree rooted at $x$, so that
+$x.\mathit{size} = x.\mathit{left}.\mathit{size} + x.\mathit{right}.\mathit{size} + 1$.
+The textbook builds its order-statistic tree on a red-black tree. Here the
+underlying tree is a plain BST, which changes three things.
+
+\subsubsection*{Missing sentinel}
+In a red-black tree every \NIL{} child is the sentinel $T.\mathit{nil}$, whose
+size is 0. A plain BST has no sentinel, so every read of
+$x.\mathit{left}.\mathit{size}$ or $x.\mathit{right}.\mathit{size}$ is replaced
+by $\textsc{Size}(x.\mathit{left})$, which returns 0 for \NIL{}. This is the
+only change needed in \SEL{} and \RANK{}, apart from \SEL{} returning \NIL{} if
+it is asked for a rank outside $[1, n]$ instead of reading a field of \NIL{}.
+
+\subsubsection*{Maintaining size during insertion}
+\INS{} places the new node $z$ as a leaf. The nodes whose subtrees gain $z$
+are exactly the nodes on the path from the root to $z$'s parent, which are the
+nodes the search loop already visits. Incrementing each one as the loop passes
+it, and giving $z$ size 1, keeps every size correct
+(Algorithm~\ref{alg:ins}). The extra cost is one increment per node visited,
+so the running time stays $O(h)$.
+
+\begin{algorithm}[t]
+\caption{\INS{}$(T, z)$ with size maintenance}
+\label{alg:ins}
+\begin{algorithmic}[1]
+\State $y = \NIL$
+\State $x = T.\mathit{root}$
+\While{$x \ne \NIL$}
+  \State $x.\mathit{size} = x.\mathit{size} + 1$ \Comment{\new}
+  \State $y = x$
+  \If{$z.\mathit{key} < x.\mathit{key}$} $x = x.\mathit{left}$
+  \Else{} $x = x.\mathit{right}$
+  \EndIf
+\EndWhile
+\State $z.\mathit{size} = 1$ \Comment{\new}
+\State $z.p = y$
+\If{$y == \NIL$} $T.\mathit{root} = z$
+\ElsIf{$z.\mathit{key} < y.\mathit{key}$} $y.\mathit{left} = z$
+\Else{} $y.\mathit{right} = z$
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{\DEL{}$(T, z)$ with size maintenance}
+\label{alg:del}
+\begin{algorithmic}[1]
+\If{$z.\mathit{left} == \NIL$}
+  \State \textsc{Decrement-To-Root}$(z.p)$ \Comment{\new}
+  \State \TRANS$(T, z, z.\mathit{right})$
+\ElsIf{$z.\mathit{right} == \NIL$}
+  \State \textsc{Decrement-To-Root}$(z.p)$ \Comment{\new}
+  \State \TRANS$(T, z, z.\mathit{left})$
+\Else
+  \State $y = \textsc{Tree-Minimum}(z.\mathit{right})$
+  \State \textsc{Decrement-To-Root}$(y.p)$ \Comment{\new}
+  \If{$y.p \ne z$}
+    \State \TRANS$(T, y, y.\mathit{right})$
+    \State $y.\mathit{right} = z.\mathit{right}$
+    \State $y.\mathit{right}.p = y$
+  \EndIf
+  \State \TRANS$(T, z, y)$
+  \State $y.\mathit{left} = z.\mathit{left}$
+  \State $y.\mathit{left}.p = y$
+  \State $y.\mathit{size} = z.\mathit{size}$ \Comment{\new}
+\EndIf
+\Statex
+\Statex \textsc{Decrement-To-Root}$(x)$ \Comment{\new}
+\While{$x \ne \NIL$}
+  \State $x.\mathit{size} = x.\mathit{size} - 1$
+  \State $x = x.p$
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection*{Maintaining size during deletion}
+\DEL{} always removes exactly one node from one position in the tree: $z$
+itself when $z$ has at most one child, or $z$'s successor $y$ when $z$ has two
+children (in that case $y$ leaves its old position and takes $z$'s place). The
+nodes that lose a descendant are precisely the ancestors of the position that
+is vacated. Algorithm~\ref{alg:del} therefore walks from the parent of that
+position up to the root, subtracting one from each size, before any pointers
+are changed, while the parent pointers still describe the old path:
+\begin{itemize}
+\item If $z$ has at most one child, its child (possibly \NIL{}) moves up into
+$z$'s place with its subtree unchanged. Only $z$'s ancestors lose a node, so
+the walk starts at $z.p$.
+\item If $z$ has two children, $y$ is removed from its old position, so the
+walk starts at $y.p$. Because $y$ lies in $z$'s right subtree, this walk
+passes through $z$ and then $z$'s ancestors (when $y.p = z$ it starts at $z$
+itself). $y.\mathit{right}$ moves up into $y$'s old place with its subtree
+unchanged. Finally $y$ takes over $z$'s position and $z$'s subtree, which now
+holds every node $z$ had except $y$; that number is exactly $z$'s
+already-reduced size, so $y.\mathit{size} = z.\mathit{size}$.
+\end{itemize}
+No other node's subtree changes, so all sizes stay correct. The upward walk
+adds $O(h)$ work. This keeps \DEL{} within $O(h)$, but it changes its
+character: the plain version only ever moves \emph{down} from $z$, while the
+augmented version always walks the full distance from the vacated position up
+to the root.
+
+\subsection{Expected Cost of the Order-Statistic Operations}
+
+\SEL{} follows one path down from the root to the node it returns, and
+\RANK{} follows one path up from a node to the root, so both run in $O(h)$.
+The augmented \INS{} and \DEL{} are also $O(h)$. On a random BST every one of
+these paths has the length of a typical root-to-node path, whose expected
+number of nodes is
+\begin{equation}
+E[\text{depth}] + 1 = 2\left(1 + \tfrac{1}{n}\right)H_n - 3 \sim 1.386\lg n,
+\label{eq:depth}
+\end{equation}
+so all four operations should take $\Theta(\lg n)$ expected time.
+
+% -----------------------------------------------------------------------------
+\section{Implementation}
+
+All algorithms were written from scratch in Java~21 without external
+libraries. Nodes are objects with an \texttt{int} key and \texttt{left},
+\texttt{right} and \texttt{p} references; order-statistic nodes add an
+\texttt{int size}. The plain BST and the order-statistic tree are separate
+classes so that the timings of one are not affected by the other's fields.
+
+To keep timings meaningful, \WALK{} adds each key to a running sum instead of
+printing it, since printing would cost far more than the walk. The tree height
+is computed with a level-by-level traversal so that a chain of length $n$
+cannot overflow the call stack.
+
+% -----------------------------------------------------------------------------
+\section{Experimental Methodology}
+
+\subsection{Platform}
+
+All runs were made on a cloud virtual machine with two vCPUs of an Intel Xeon
+processor at \SI{2.80}{\giga\hertz}, \SI{32}{\kibi\byte} of L1 data cache and
+\SI{1}{\mebi\byte} of L2 cache per core, \SI{33}{\mebi\byte} of shared L3
+cache and \SI{8}{\giga\byte} of RAM, running Linux and OpenJDK~21.0.12 with a
+\SI{4}{\gibi\byte} maximum heap. Each tree node occupies about
+\SI{32}{\byte}, so a tree of $2^{15}$ nodes fills one core's L2 cache and a
+tree of $2^{20}$ nodes fills the L3 cache.
+
+\subsection{Input Generation}
+
+Each tree was built from the keys $1, \dots, n$ in an order produced by a
+Fisher--Yates shuffle, so every permutation is equally likely and every tree
+is a randomly built BST in the sense of Section~12.4 of~\cite{clrs}. A fresh permutation was
+drawn for every tree. Keys are distinct by construction.
+
+Part~A used 37 values of $n$, namely $\operatorname{round}(2^{k/2})$ for
+$k = 8, \dots, 44$, from $n = 16$ to $n = 2^{22} = 4\,194\,304$. These are
+evenly spaced on a log scale and include every power of two in that range.
+The number of trees per size was chosen so that every size received roughly
+the same total work: 1000 trees for $n \le 2896$, falling to 10 trees from
+$n = 2^{18}$ upwards, for 18\,612 trees in all. Each tree was built, its height
+recorded, walked, and then destroyed.
+
+Three supplementary runs isolated specific effects. The first built trees from
+\emph{sorted} keys (chains) for $n$ from $2^6$ to $2^{15}$, five per size, to
+time the walk on the worst-case shape. The second rebuilt random trees without
+timing them and counted the nodes visited by building and by destroying
+(30 trees per size up to $2^{16}$, five above). The third followed the height
+of fifty trees of $2^{16}$ nodes at every halving of their size as they were
+destroyed.
+
+\subsection{Timing}
+
+Times were taken with \texttt{System.nanoTime}. Node objects were allocated
+before the timer started, because \INS{} takes an existing node as its
+argument and allocation inside the timed loop also measured the garbage
+collector copying the growing tree. Thirty untimed builds of 20\,000-node trees
+preceded each run to let the JIT compiler finish optimising the code, and a
+garbage collection was requested between sizes. A walk of a small tree takes
+well under a microsecond, so the walk was repeated until about $2^{18}$ nodes
+had been visited and the time divided by the number of repetitions; it was
+timed on the first 30 trees of each size. The walk's key sum was accumulated
+into a checksum printed at the end, so the compiler could not remove the walk
+as dead code~\cite{georges}.
+
+\subsection{Correctness}
+
+Before any timing, a separate test built 200 random trees of sizes from 1 to
+1000 with both tree types, then deleted half of the keys in random order and
+finally destroyed each tree from the root. After every operation on trees of
+up to 100 keys (and periodically on larger ones) it checked the BST property,
+every parent pointer, and every \textit{size} field against a recount of the
+subtree, and it checked \SEL{}$(i)$ and \RANK{} against a sorted list of the
+keys for every $i$. All checks passed. To make sure the test could detect
+errors, it was rerun on two deliberately broken versions of \DEL{}, one
+omitting $y.\mathit{size} = z.\mathit{size}$ and one starting the decrement at
+$z.p$ instead of $y.p$; both were caught with thousands of failures.
+
+% -----------------------------------------------------------------------------
+\section{Results: Binary Search Trees}
+
+\subsection{Expected Height}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{height.pdf}
+\caption{Mean height of randomly built BSTs over 37 sizes, against the textbook
+bound~\eqref{eq:clrs}, Reed's asymptotic expansion~\eqref{eq:reed} and the
+minimum possible height. The shaded band is one standard deviation.}
+\label{fig:height}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{Height of randomly built BSTs at selected sizes.}
+\label{tab:height}
+\begin{tabular}{rrrcrr}
+\toprule
+$n$ & trees & mean $h$ & range & s.d. & $h/\lg n$ \\
+\midrule
+$2^{4}$  & 1000 &  6.11 & 4--10  & 1.08 & 1.53 \\
+$2^{8}$  & 1000 & 15.66 & 12--23 & 1.66 & 1.96 \\
+$2^{12}$ &  814 & 26.63 & 22--34 & 2.04 & 2.22 \\
+$2^{16}$ &   38 & 37.53 & 34--43 & 2.26 & 2.35 \\
+$2^{20}$ &   10 & 49.60 & 47--52 & 2.01 & 2.48 \\
+$2^{22}$ &   10 & 55.30 & 52--60 & 2.36 & 2.51 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Fig.~\ref{fig:height} and Table~\ref{tab:height} show the measured heights.
+Plotted against $\lg n$, the mean height is very close to a straight line,
+which is exactly what $E[h] = O(\lg n)$ predicts. A least-squares fit over
+$n \ge 2^{10}$ gives
+\begin{equation}
+\bar h \approx 2.856\lg n - 7.70,
+\end{equation}
+so each doubling of $n$ adds about 2.86 levels to the tree. This matches the
+local slope of $2.87$ obtained from~\eqref{eq:reed} at the middle of the
+range. The measured heights sit about five levels below Reed's expression,
+a constant gap absorbed by its $O(1)$ term, and below the textbook
+bound~\eqref{eq:clrs} at every size. The bound is therefore not just correct
+but reasonably tight: at $n = 2^{22}$ it allows a mean height of 61.4,
+against 55.3 measured.
+
+The heights are also tightly concentrated. The standard deviation stayed
+below 3.2 levels at every size, and no tree with more than 1000 keys had a
+height above $3.2\lfloor\lg n\rfloor$, far from the $n-1$ of a chain. The ratio $h/\lg n$ rises
+slowly with $n$ because of the negative constant in the fit; it should approach
+$\alpha\ln 2 \approx 2.99$ only as $n \to \infty$.
+
+\subsection{Building and Destroying}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{build_destroy.pdf}
+\caption{Building a random BST with $n$ calls to \INS{} and destroying it with
+$n$ calls to \DEL{} on the root. (a) Mean running time. (b) Nodes visited,
+measured in an untimed run, against the exact expectations~\eqref{eq:build}
+and~\eqref{eq:destroy}; both are normalised by $n\lg n$. (c) Running time
+divided by nodes visited.}
+\label{fig:build}
+\end{figure*}
+
+Fig.~\ref{fig:build}(a) shows that building and destroying both grow slightly
+faster than $n\lg n$ for small trees and noticeably faster for large ones.
+Regression of $\log T$ on $\log n$ over $2^8 \le n \le 2^{22}$ gives exponents
+of $1.42 \pm 0.04$ for building and $1.35 \pm 0.05$ for destroying, where an
+exact $n\lg n$ curve would give 1.10 over the same range.
+
+Fig.~\ref{fig:build}(b) shows this is not because the algorithms do more work
+than expected. The number of nodes visited agrees with the exact
+expectations~\eqref{eq:build} and~\eqref{eq:destroy} to within about 3\% at
+every size from $2^8$ upward, and converges towards the predicted limits of
+$1.386\,n\lg n$ for building and $0.693\,n\lg n$ for destroying (1.25 and 0.68
+at $n = 2^{22}$, since the lower-order terms decay slowly). Destroying a tree
+visits 0.53 to 0.62 times as many nodes as building it, matching the
+prediction of one half.
+
+The deletion trace supports the assumption behind
+\eqref{eq:destroy}. Across fifty trees of $2^{16}$ nodes, the height at every
+halving during destruction (Fig.~\ref{fig:deltrace}) stayed within 0.42 levels
+of the mean height of a freshly built random tree of the same size, so
+repeated root deletion does not unbalance the tree.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{deltrace.pdf}
+\caption{Height of a tree of $2^{16}$ keys as it is destroyed by deleting the
+root, compared with freshly built random trees of the same size. Mean of 50
+trees.}
+\label{fig:deltrace}
+\end{figure}
+
+The extra growth in time comes entirely from the cost of each visit,
+Fig.~\ref{fig:build}(c). Up to about $2^{15}$ nodes a visit costs a steady
+6--9\,ns for building and 5--7\,ns for destroying. Beyond that the tree no
+longer fits in the \SI{1}{\mebi\byte} L2 cache, and beyond $2^{20}$ nodes it no
+longer fits in the L3 cache either; at $n = 2^{22}$ a visit costs 100\,ns when
+building and 75\,ns when destroying. The path from the root to a random leaf
+jumps between nodes allocated at unrelated times, so for a large tree almost
+every step down is a cache miss. The algorithm's step count is
+$\Theta(n\lg n)$ as theory says, but the price of a step is not constant.
+
+\subsection{Inorder Tree Walk}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{walk.pdf}
+\caption{Time for one \WALK{}. Random BSTs with nodes allocated in insertion
+order (the normal case), random BSTs with the same shape but nodes allocated
+in key order, and chains built from sorted keys. (a) Mean time per walk.
+(b) Time per node.}
+\label{fig:walk}
+\end{figure*}
+
+\WALK{} visits each node exactly once, so its operation count is exactly $n$.
+On chains the measured time grew with exponent $1.04 \pm 0.08$
+(Fig.~\ref{fig:walk}), confirming $\Theta(n)$ even on the worst-case shape.
+Building those chains, by contrast, grew with exponent $1.94 \pm 0.08$: sorted
+input makes every \INS{} walk the whole chain, so building costs
+$\Theta(n^2)$ and took 1.35\,s for only $2^{15}$ keys, compared with
+\SI{5}{\milli\second} for a random tree of that size.
+
+On random trees the walk scaled with exponent $1.41 \pm 0.03$, and the time
+per node rose from 4.4\,ns at $n = 2^8$ to 135\,ns at $n = 2^{22}$. The walk
+visits nodes in key order, but they sit in memory in insertion order, which
+is random; once the tree exceeds the caches, every visit is a cache miss.
+To confirm this, the experiment was repeated with the nodes allocated in key
+order but inserted in the same random order, giving trees of the same random
+shape whose nodes lie in memory in the order the walk visits them. These
+walks scaled with exponent $1.23 \pm 0.02$ and were $5.3\times$ faster at
+$n = 2^{22}$ (25.7\,ns per node). They do not reach the chain's $n^{1.04}$
+because the recursion still moves up and down a tree of height about 55 and
+the JVM may relocate objects during garbage collection, so the layout is only
+approximately sequential. The walk performs the same $n$ visits in every
+case; only the memory layout changed.
+
+% -----------------------------------------------------------------------------
+\section{Results: Order-Statistic Trees}
+
+\subsection{Setup}
+
+For part B, both a plain BST and an order-statistic tree were built from the
+same $n$ shuffled keys, for 25 sizes from $n = 2^{10}$ to $2^{22}$ (40 trials
+per size up to $2^{16}$, 20 up to $2^{19}$, and 10 above). In each trial
+$m = 1000$ further keys were then inserted into each tree, 1000
+\SEL{}$(T.\mathit{root}, i)$ calls were made with $i$ uniform over the current
+size, 1000 \RANK{} calls were made on uniformly chosen nodes, and 1000
+uniformly chosen nodes were deleted from each tree. Finally both trees were
+destroyed from the root. Each batch of 1000 operations was timed as a whole
+and divided by 1000. The two tree types alternated in going first, and both
+were given the same memory layout (nodes allocated in insertion order, with a
+garbage collection before timing), so that differences between them come from
+the algorithms and not from where their nodes happen to sit in memory.
+
+\subsection{Order-Statistic Operations}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{os_ops.pdf}
+\caption{The four operations on order-statistic trees. (a) Mean time per
+operation, with one standard deviation. (b) Time divided by the expected
+number of nodes on a root-to-node path~\eqref{eq:depth}.}
+\label{fig:osops}
+\end{figure*}
+
+\begin{table}[t]
+\centering
+\caption{Mean time per operation (ns) on plain BSTs and order-statistic (OS)
+trees.}
+\label{tab:ops}
+\setlength{\tabcolsep}{4.5pt}
+\begin{tabular}{rrrrrrr}
+\toprule
+ & \multicolumn{2}{c}{\INS{}} & \multicolumn{2}{c}{\DEL{}} & & \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+$n$ & BST & OS & BST & OS & \SEL{} & \RANK{} \\
+\midrule
+$2^{10}$ &  106 &  128 &  116 &  165 &  354 &  180 \\
+$2^{13}$ &  210 &  274 &  149 &  207 &  208 &  254 \\
+$2^{16}$ &  904 &  779 &  311 &  596 &  664 &  444 \\
+$2^{19}$ & 1894 & 1927 & 1008 & 2078 & 1765 & 1184 \\
+$2^{22}$ & 3324 & 3091 & 1180 & 2796 & 3195 & 2243 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Fig.~\ref{fig:osops}(a) and Table~\ref{tab:ops} show the mean cost of each
+operation. Between $n = 2^{10}$ and $n = 2^{22}$ the expected root-to-node
+path~\eqref{eq:depth} grows from 13.4 to 28.7 nodes, a factor of 2.1, while
+the measured times grew by factors of 9 to 24. Dividing each time by the
+expected path length (Fig.~\ref{fig:osops}(b)) explains the difference. Up to
+about $2^{13}$ keys every operation costs a roughly constant 10--17\,ns per
+node on its path. From there the cost per node climbs to 80--110\,ns at
+$n = 2^{22}$, the same rise seen in the cost per visit when building and
+destroying trees (Fig.~\ref{fig:build}(c)). The four operations therefore do
+$\Theta(\lg n)$ work each, as expected, and the extra growth is again the
+memory system. Individual batches are short (0.1--0.3\,ms for small trees),
+so the small sizes are noisy, for example \SEL{} at $n = 2^{10}$; the error
+bars show the spread.
+
+\RANK{} was consistently the cheapest of the four, about 30\% below the others
+per node at large $n$. A likely reason is that \SEL{} must read the left
+child's size before it knows which way to go, so each step waits on a memory
+access, whereas the next node in \RANK{} is simply the parent, and the sibling
+size it reads does not decide the path. The processor can therefore overlap
+more of \RANK{}'s memory accesses.
+
+\subsection{Cost of Maintaining the Size Attribute}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{os_vs_bst.pdf}
+\caption{Plain BST against order-statistic tree on identical keys.
+(a) Mean time per \INS{} and per \DEL{} of a random node. (b) Ratio of
+order-statistic tree time to plain BST time, for single operations and for
+whole builds and destroys.}
+\label{fig:osbst}
+\end{figure*}
+
+Fig.~\ref{fig:osbst} compares the two trees directly. For insertion the extra
+work is invisible: the order-statistic \INS{} took on average 1.02 times as
+long as the plain one, and 1.00 times for $n > 2^{16}$. The size increment
+happens on a node the search has just loaded to compare keys, so it costs
+almost nothing. Whole builds behaved the same way (ratio 1.09 overall, 1.02
+above $2^{16}$), as did destroying from the root (1.13 overall, 1.06 above
+$2^{16}$). In the latter case the decrement walk starts at the successor's
+parent and climbs the left spine that \textsc{Tree-Minimum} has just walked
+down, so those nodes are still in the cache.
+
+Deleting a random node is different. The order-statistic \DEL{} took 1.85 times
+as long as the plain one on average, rising from about 1.6 for
+$n \le 2^{16}$ to 2.1 above and reaching 2.45. The untimed run explains why.
+Given a pointer to $z$, plain \DEL{} only touches $z$ and, if $z$ has two
+children, the path to its successor. Over every node of the random trees, this
+averaged 1.75 nodes at every size from $2^{10}$ to $2^{22}$, so on a random
+tree plain deletion of a known node takes expected constant time. The
+augmented version must also visit every ancestor of the vacated position,
+which averages 12.0 nodes at $n = 2^{10}$ and 28.6 at $n = 2^{22}$, making it
+$\Theta(\lg n)$. The measured ratio is much smaller than the ratio of node
+counts because the nodes near the root lie on every path and stay in the
+cache, so most of the upward walk is cheap; the cost is dominated by the few
+misses near the bottom of the tree, which both versions pay. The plain
+\DEL{} still slowed from 116\,ns to 1180\,ns over the range for the same reason:
+the one or two nodes it touches are scattered in memory.
+
+% -----------------------------------------------------------------------------
+\section{Discussion}
+
+Three conclusions follow from these measurements.
+
+First, the theory was confirmed wherever it makes a prediction about work done.
+The expected height of a randomly built BST grew linearly in $\lg n$ with the
+slope predicted by~\eqref{eq:reed}, inside the bound of Theorem~12.4, and with
+little variation between trees. The numbers of nodes visited by building and
+destroying matched their exact expectations to within about 3\%, the tree stayed
+random as it was destroyed, \WALK{} performed $n$ visits on every shape, and
+the order-statistic operations followed paths of the expected
+$\Theta(\lg n)$ length.
+
+Second, running time did not follow the work as closely as in a flat-memory
+model. The cost of one step down a tree rose about fifteenfold between small
+trees and trees of four million nodes, because a pointer-based tree with a
+random shape spreads consecutive steps across unrelated parts of memory.
+This made $\Theta(n\lg n)$ procedures look like $n^{1.4}$ and a $\Theta(n)$
+walk look like $n^{1.41}$. Changing only where the nodes were allocated gave
+the walk a $5.3\times$ speedup. Separating operation counts from times was
+what made it possible to tell these two effects apart.
+
+Third, the size augmentation is cheap exactly where the original operation
+already visits the affected nodes. Insertion and \SEL{} walk the root path
+anyway, so they gained little or nothing. Deletion of a known node does not,
+so maintaining sizes turned an expected constant-time operation into a
+$\Theta(\lg n)$ one and doubled its time on large trees. The textbook's
+red-black version pays for the same upward walk, but there it sits inside a
+deletion that is already $O(\lg n)$ in the worst case.
+
+Some limitations apply. All results come from one virtual machine, so the
+constants and the sizes where the cache effects begin will differ on other
+hardware, although the operation counts and the height results do not depend
+on the machine. The JVM moves objects during garbage collection, so memory
+layout was controlled only approximately. Finally, every tree was built from
+random insertions only. Long sequences that mix insertions and deletions are
+known to make BSTs less balanced than a random tree~\cite{eppinger}, so the
+height results here apply to randomly built trees and not to trees with an
+arbitrary history of updates.
+
+% -----------------------------------------------------------------------------
+\section{Conclusion}
+
+\INS{}, \DEL{} and \WALK{} were implemented as in~\cite{clrs}, along with an
+order-statistic tree on a plain BST supporting \SEL{} and \RANK{}. Over
+18\,612 randomly built trees of up to $2^{22}$ keys, the mean height grew as
+$2.86\lg n - 7.7$, confirming the $O(\lg n)$ expected height of Theorem~12.4
+and staying below its bound at every size. Building and destroying visited
+$\Theta(n\lg n)$ nodes in close agreement with their exact expectations, and
+the inorder walk visited exactly $n$. Size maintenance in \INS{} costs one
+increment per node on the search path and in \DEL{} a walk from the vacated
+position to the root; this left insertion as fast as before but made deletion
+about twice as slow on large trees. Across all experiments the operation
+counts followed the theory closely, while the running times grew faster
+because the cost of each step rose as the trees outgrew the processor caches.
+
+\begin{thebibliography}{9}
+
+\bibitem{clrs}
+T.~H. Cormen, C.~E. Leiserson, R.~L. Rivest, and C.~Stein, \textit{Introduction
+to Algorithms}, 3rd~ed. Cambridge, MA, USA: MIT Press, 2009.
+
+\bibitem{devroye}
+L.~Devroye, ``A note on the height of binary search trees,''
+\textit{J. ACM}, vol.~33, no.~3, pp.~489--498, 1986.
+
+\bibitem{reed}
+B.~Reed, ``The height of a random binary search tree,'' \textit{J. ACM},
+vol.~50, no.~3, pp.~306--332, 2003.
+
+\bibitem{knuth}
+D.~E. Knuth, \textit{The Art of Computer Programming, Vol.~3: Sorting and
+Searching}, 2nd~ed. Reading, MA, USA: Addison-Wesley, 1998.
+
+\bibitem{hibbard}
+T.~N. Hibbard, ``Some combinatorial properties of certain trees with
+applications to searching and sorting,'' \textit{J. ACM}, vol.~9, no.~1,
+pp.~13--28, 1962.
+
+\bibitem{eppinger}
+J.~L. Eppinger, ``An empirical study of insertion and deletion in binary
+search trees,'' \textit{Commun. ACM}, vol.~26, no.~9, pp.~663--669, 1983.
+
+\bibitem{georges}
+A.~Georges, D.~Buytaert, and L.~Eeckhout, ``Statistically rigorous Java
+performance evaluation,'' in \textit{Proc. OOPSLA}, 2007, pp.~57--76.
+
+\end{thebibliography}
+
+\end{document}

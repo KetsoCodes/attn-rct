@@ -1,11 +1,8 @@
-"""Tests for the task registry and the CIFAR-10 Image-task loader.
+"""Tests the task registry, CIFAR-10, and Pathfinder loaders.
 
-The registry's promise is that every task hands the model the same thing: (ids, mask,
-targets) with a uniform meta. If a task quietly returned a different shape, the model
-would still run and the failure would surface only as bad numbers. So the shape contract
-is tested per task, and the CIFAR-specific transforms -- greyscale conversion, fixed
-length, the deterministic split -- are checked directly, because they are what make the
-task comparable to the published LRA Image benchmark.
+Ensures every task returns identical structures: (ids, mask, targets) plus a uniform meta. 
+Also verifies task-specific transforms like greyscale conversion, fixed lengths, and 
+deterministic train/val splits to maintain parity with the published LRA benchmarks.
 """
 
 import pickle
@@ -20,7 +17,7 @@ from attn_rct import data
 # ---- fixtures ----
 
 def write_cifar(tmp_path, per_batch=100, seed=0):
-    """Write a format-accurate miniature CIFAR-10 tree and return its parent dir."""
+    """Creates a format-accurate miniature CIFAR-10 dataset."""
     root = tmp_path / "cifar-10-batches-py"
     root.mkdir()
     rng = np.random.default_rng(seed)
@@ -38,8 +35,6 @@ def write_cifar(tmp_path, per_batch=100, seed=0):
 # ---- registry ----
 
 def test_registry_lists_both_tasks():
-    # Superseded by test_registry_lists_three_tasks once Pathfinder was added; kept as a
-    # membership check that the two original tasks are still present.
     assert {"listops", "cifar"} <= set(data.TASK_REGISTRY)
 
 
@@ -53,7 +48,7 @@ def test_unknown_task_is_refused(tmp_path):
 def test_pure_red_greyscale_value():
     """BT.601 luma of pure red is 0.299 * 255 ~ 76."""
     red = np.zeros((1, 3072), dtype=np.uint8)
-    red[0, :1024] = 255                          # R channel full, G and B zero
+    red[0, :1024] = 255
     tokens = data.cifar_to_grey_tokens(red)
     assert tokens[0, 0] == round(0.299 * 255)
 
@@ -74,7 +69,7 @@ def test_greyscale_output_is_uint8_length_1024():
 
 
 def test_white_and_black_map_to_extremes():
-    """All-255 input is white (~255), all-0 is black (0), regardless of channel weights."""
+    """Ensures white maps to 255 and black to 0."""
     white = np.full((1, 3072), 255, dtype=np.uint8)
     black = np.zeros((1, 3072), dtype=np.uint8)
     assert data.cifar_to_grey_tokens(white)[0, 0] == 255
@@ -90,20 +85,20 @@ def test_cifar_meta_is_correct(tmp_path):
 
 
 def test_cifar_batch_shape_and_mask(tmp_path):
-    """Every CIFAR batch is fixed length with an all-ones mask -- nothing is padded."""
+    """Checks that every CIFAR batch is fixed length with an all-ones mask."""
     parent = write_cifar(tmp_path)
     train, _, _ = data.build_dataloaders("cifar", parent, 1024, 8, seed=0, num_workers=0)
     ids, mask, targets = next(iter(train))
     assert ids.shape == (8, 1024)
     assert mask.shape == (8, 1024)
     assert targets.shape == (8,)
-    assert bool(mask.all()), "CIFAR is fixed-length; the mask must be all ones"
+    assert bool(mask.all())
     assert ids.dtype == torch.long
     assert 0 <= int(ids.min()) and int(ids.max()) <= 255
 
 
 def test_cifar_wrong_max_len_is_refused(tmp_path):
-    """A fixed-length task must reject a max_len that is not its sequence length."""
+    """Fails if max_len doesn't match the fixed sequence length."""
     parent = write_cifar(tmp_path)
     with pytest.raises(ValueError, match="fixed-length task"):
         data.build_dataloaders("cifar", parent, 2000, 8, seed=0, num_workers=0)
@@ -115,19 +110,15 @@ def test_cifar_missing_data_is_refused(tmp_path):
 
 
 def test_cifar_val_split_is_ten_percent(tmp_path):
-    """The default split holds out 10% of the 5-batch training pool for validation."""
-    parent = write_cifar(tmp_path, per_batch=100)     # 500 total
+    """Ensures we hold out exactly 10% of the training pool for validation."""
+    parent = write_cifar(tmp_path, per_batch=100)
     train, val, _ = data.build_dataloaders("cifar", parent, 1024, 8, seed=0, num_workers=0)
     assert len(val.dataset) == 50
     assert len(train.dataset) == 450
 
 
 def test_cifar_split_is_deterministic_across_seeds(tmp_path):
-    """The train/val partition must not depend on the run seed.
-
-    The paired design requires every arm and seed of a cell to see the same split;
-    only batch ORDER may depend on the seed, never split MEMBERSHIP.
-    """
+    """Train/val splits must remain identical across seeds to support the paired design."""
     parent = write_cifar(tmp_path)
     _, val0, _ = data.build_dataloaders("cifar", parent, 1024, 8, seed=0, num_workers=0)
     _, val1, _ = data.build_dataloaders("cifar", parent, 1024, 8, seed=1, num_workers=0)
@@ -138,7 +129,7 @@ def test_cifar_split_is_deterministic_across_seeds(tmp_path):
 
 
 def test_cifar_train_and_val_are_disjoint(tmp_path):
-    """No image may appear in both splits."""
+    """Ensures no image leaks between train and validation splits."""
     parent = write_cifar(tmp_path)
     train, val, _ = data.build_dataloaders("cifar", parent, 1024, 8, seed=0, num_workers=0)
     train_rows = {row.tobytes() for row in train.dataset.tokens}
@@ -147,21 +138,19 @@ def test_cifar_train_and_val_are_disjoint(tmp_path):
 
 
 def test_batch_order_depends_on_seed(tmp_path):
-    """Different seeds shuffle the training batches differently, as the pairing needs."""
+    """Different seeds should shuffle the training batches differently."""
     parent = write_cifar(tmp_path)
     train0, _, _ = data.build_dataloaders("cifar", parent, 1024, 8, seed=0, num_workers=0)
     train1, _, _ = data.build_dataloaders("cifar", parent, 1024, 8, seed=1, num_workers=0)
     first0 = next(iter(train0))[2]
     first1 = next(iter(train1))[2]
-    # Overwhelmingly likely to differ; identical would mean the seed was ignored.
     assert not torch.equal(first0, first1)
 
 
 # ---- Pathfinder ----
 
 def write_pathfinder(tmp_path, n_train=200, n_dev=60, seed=0):
-    """Write format-accurate miniature Pathfinder train/dev pickles; return the dir."""
-    import pickle
+    """Creates format-accurate miniature Pathfinder train/dev pickles."""
     rng = np.random.default_rng(seed)
     for split, n in [("train", n_train), ("dev", n_dev)]:
         recs = [{"input_ids_0": rng.integers(0, 256, 1024, dtype=np.int32),
@@ -179,7 +168,7 @@ def test_pathfinder_meta_is_correct(tmp_path):
 
 
 def test_pathfinder_batch_shape_and_mask(tmp_path):
-    """Fixed-length task: every batch is 1024 wide with an all-ones mask."""
+    """Checks that Pathfinder batches are fixed length with an all-ones mask."""
     write_pathfinder(tmp_path)
     train, _, _ = data.build_dataloaders("pathfinder", tmp_path, 1024, 8, seed=0, num_workers=0)
     ids, mask, targets = next(iter(train))
@@ -190,7 +179,7 @@ def test_pathfinder_batch_shape_and_mask(tmp_path):
 
 
 def test_pathfinder_uses_own_train_dev_splits(tmp_path):
-    """Unlike CIFAR, Pathfinder ships its own splits; train and dev sizes come from the files."""
+    """Ensures train and dev sizes match the shipped Pathfinder split files."""
     write_pathfinder(tmp_path, n_train=200, n_dev=60)
     train, val, _ = data.build_dataloaders("pathfinder", tmp_path, 1024, 8, seed=0, num_workers=0)
     assert len(train.dataset) == 200
@@ -204,8 +193,7 @@ def test_pathfinder_wrong_max_len_is_refused(tmp_path):
 
 
 def test_pathfinder_missing_split_is_refused(tmp_path):
-    """A dir with only the train pickle must fail, not silently train without validation."""
-    import pickle
+    """Fails if a split is missing to prevent silently training without validation."""
     rng = np.random.default_rng(0)
     recs = [{"input_ids_0": rng.integers(0, 256, 1024, dtype=np.int32), "label": 0}
             for _ in range(10)]
@@ -216,8 +204,7 @@ def test_pathfinder_missing_split_is_refused(tmp_path):
 
 
 def test_pathfinder_wrong_resolution_pickle_is_caught(tmp_path):
-    """A pickle whose sequences are not 1024 long (wrong resolution) is rejected."""
-    import pickle
+    """Rejects pickles if the sequence length doesn't match the expected resolution."""
     rng = np.random.default_rng(0)
     for split in ("train", "dev"):
         recs = [{"input_ids_0": rng.integers(0, 256, 4096, dtype=np.int32), "label": 0}
@@ -228,5 +215,6 @@ def test_pathfinder_wrong_resolution_pickle_is_caught(tmp_path):
         data.build_dataloaders("pathfinder", tmp_path, 1024, 8, seed=0, num_workers=0)
 
 
-def test_registry_lists_three_tasks():
-    assert set(data.TASK_REGISTRY) == {"listops", "cifar", "pathfinder"}
+def test_registry_lists_the_four_tasks():
+    """Adding or dropping a task should be a deliberate, visible change."""
+    assert set(data.TASK_REGISTRY) == {"listops", "cifar", "pathfinder", "text"}
