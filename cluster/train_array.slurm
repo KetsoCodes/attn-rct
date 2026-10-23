@@ -6,6 +6,7 @@
 #SBATCH --time=08:00:00
 #SBATCH --nodes=1
 #SBATCH --signal=B:USR1@600
+#SBATCH --exclude=mscluster44,mscluster45,mscluster47,mscluster51,mscluster57,mscluster58,mscluster61,mscluster62,mscluster64,mscluster66,mscluster67,mscluster68,mscluster69,mscluster70,mscluster74,mscluster78,mscluster83
 
 # Submit using an array throttle (e.g., `sbatch --array=1-120%6 cluster/train_array.slurm`)
 # to respect the cluster's concurrent job limit.
@@ -21,6 +22,10 @@
 # cells were lost this way at 7h55m; they survived only because of the 30-minute and
 # per-epoch checkpoints. The lead time is 10 minutes, not 5, so even a slow batch and the
 # checkpoint write fit inside it.
+#
+# Node exclusion. These nodes have repeatedly shown dead GPUs ("No devices were found").
+# The pre-flight check below catches a dead card anyway, but excluding the known-bad nodes
+# stops a job landing on one in the first place.
 
 set -euo pipefail
 
@@ -64,8 +69,12 @@ echo "=== $RUN_ID | task $SLURM_ARRAY_TASK_ID | $(hostname) | $(date) ==="
 echo "row: $ROW"
 
 # GPU Pre-flight Check: Validates GPU functionality before initiating training.
-# If the node has a wedged or unresponsive GPU, the script immediately requeues the task
-# to a different node. This prevents silently consuming and failing array jobs on dead nodes.
+# If the node has a wedged or unresponsive GPU, the script requeues the task to try a
+# different node. It then exits 0, not 1: a task that requeued itself and then exited with
+# an error was observed to come back in a HELD state ("job requeued in held state"), where
+# it never runs again until someone releases it by hand. Three Text cells sat held for two
+# days that way. The walltime path below already exits 0 after requeuing, and those resume
+# normally.
 gpu_ok=1
 nvidia-smi --query-gpu=name --format=csv,noheader >/dev/null 2>&1 || gpu_ok=0
 if [ "$gpu_ok" = "1" ]; then
@@ -77,7 +86,7 @@ if [ "$gpu_ok" = "0" ]; then
     nvidia-smi 2>&1 | head -3 || true
     echo "  requeuing ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} to try another node."
     scontrol requeue "${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
-    exit 1
+    exit 0
 fi
 nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader
 
